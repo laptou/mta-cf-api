@@ -9,8 +9,15 @@
 		"cf-typegen": "wrangler types"
 	},
 	"devDependencies": {
+		"@biomejs/biome": "^1.9.4",
 		"@cloudflare/workers-types": "^4.20250214.0",
+		"@types/yauzl": "^2.10.3",
 		"typescript": "^5.5.2",
 		"wrangler": "^3.109.2"
+	},
+	"dependencies": {
+		"csv-parse": "^5.6.0",
+		"temporal-polyfill": "^0.2.5",
+		"yauzl": "^3.2.0"
 	}
 }
