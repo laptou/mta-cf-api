@@ -31,45 +31,32 @@ const zipFromBuffer = (buf: Buffer, opts: yauzl.Options) =>
 async function* processZipEntries(
 	zip: yauzl.ZipFile,
 ): AsyncGenerator<[string, NodeJS.ReadableStream]> {
-	return new Promise<AsyncGenerator<[string, NodeJS.ReadableStream]>>(
-		async (resolve, reject) => {
-			try {
-				const generator = (async function* () {
-					while (true) {
-						const entry: yauzl.Entry = await new Promise((resolve, reject) => {
-							zip.once("entry", resolve);
-							zip.once("end", () => resolve(null));
-							zip.once("error", reject);
-						});
+	while (true) {
+		const entry: yauzl.Entry | null = await new Promise((resolve, reject) => {
+			zip.once("entry", resolve);
+			zip.once("end", () => resolve(null));
+			zip.once("error", reject);
+			zip.readEntry();
+		});
 
-						if (!entry) break;
+		if (!entry) break;
 
-						// Skip shapes.txt if present
-						if (entry.fileName === "shapes.txt") {
-							zip.readEntry();
-							continue;
-						}
+		// Skip shapes.txt if present
+		if (entry.fileName === "shapes.txt") {
+			continue;
+		}
 
-						const stream = await new Promise<NodeJS.ReadableStream>(
-							(resolve, reject) => {
-								zip.openReadStream(entry, (err, stream) => {
-									if (err) reject(err);
-									else resolve(stream);
-								});
-							},
-						);
+		const stream = await new Promise<NodeJS.ReadableStream>(
+			(resolve, reject) => {
+				zip.openReadStream(entry, (err, stream) => {
+					if (err) reject(err);
+					else resolve(stream);
+				});
+			},
+		);
 
-						yield [entry.fileName, stream];
-						zip.readEntry();
-					}
-				})();
-
-				resolve(generator);
-			} catch (err) {
-				reject(err);
-			}
-		},
-	);
+		yield [entry.fileName, stream];
+	}
 }
 
 const MTA_SUPPLEMENTED_GTFS_STATIC_URL =
@@ -196,6 +183,7 @@ export class MtaStateObject extends DurableObject {
 			default:
 				response = new Response("Not found", { status: 404 });
 		}
+
 		return response;
 	}
 
@@ -219,6 +207,7 @@ export class MtaStateObject extends DurableObject {
 
 	async loadGtfsStatic() {
 		if (!(await this.shouldUpdateGtfs())) {
+			console.log("not updating static gtfs");
 			return;
 		}
 
@@ -228,7 +217,7 @@ export class MtaStateObject extends DurableObject {
 			const gtfsResponse = await fetch(MTA_SUPPLEMENTED_GTFS_STATIC_URL);
 			const buf = Buffer.from(await gtfsResponse.arrayBuffer());
 			const gtfsArchive = await zipFromBuffer(buf, { lazyEntries: true });
-			const entries = await processZipEntries(gtfsArchive);
+			const entries = processZipEntries(gtfsArchive);
 
 			for await (const [fileName, stream] of entries) {
 				const parser = parse({
@@ -238,10 +227,12 @@ export class MtaStateObject extends DurableObject {
 
 				stream.pipe(parser);
 
+				console.log(`processing ${fileName}`);
+
 				switch (fileName) {
 					case "calendar.txt":
 						for await (const entry of parser) {
-							await this.sql.exec(
+							this.sql.exec(
 								`INSERT OR REPLACE INTO calendar
 								(service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date)
 								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -261,7 +252,7 @@ export class MtaStateObject extends DurableObject {
 
 					case "calendar_dates.txt":
 						for await (const entry of parser) {
-							await this.sql.exec(
+							this.sql.exec(
 								`INSERT OR REPLACE INTO calendar_dates
 								(service_id, date, exception_type)
 								VALUES (?, ?, ?)`,
@@ -274,7 +265,7 @@ export class MtaStateObject extends DurableObject {
 
 					case "routes.txt":
 						for await (const route of parser) {
-							await this.sql.exec(
+							this.sql.exec(
 								`INSERT OR REPLACE INTO routes
 								(route_id, agency_id, route_short_name, route_long_name, route_type,
 								route_desc, route_url, route_color, route_text_color)
@@ -296,7 +287,7 @@ export class MtaStateObject extends DurableObject {
 						for await (const entry of parser) {
 							const [aH, aM, aS] = parseGtfsTime(entry.arrival_time);
 							const [dH, dM, dS] = parseGtfsTime(entry.departure_time);
-							await this.sql.exec(
+							this.sql.exec(
 								`INSERT OR REPLACE INTO stop_times
 								(trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds,
 								departure_hours, departure_minutes, departure_seconds, stop_sequence)
@@ -316,7 +307,7 @@ export class MtaStateObject extends DurableObject {
 
 					case "stops.txt":
 						for await (const stop of parser) {
-							await this.sql.exec(
+							this.sql.exec(
 								`INSERT OR REPLACE INTO stops
 								(stop_id, stop_name, stop_lat, stop_lon, location_type, parent_station)
 								VALUES (?, ?, ?, ?, ?, ?)`,
@@ -332,7 +323,7 @@ export class MtaStateObject extends DurableObject {
 
 					case "transfers.txt":
 						for await (const transfer of parser) {
-							await this.sql.exec(
+							this.sql.exec(
 								`INSERT OR REPLACE INTO transfers
 								(from_stop_id, to_stop_id, transfer_type, min_transfer_time)
 								VALUES (?, ?, ?, ?)`,
@@ -348,7 +339,7 @@ export class MtaStateObject extends DurableObject {
 
 					case "trips.txt":
 						for await (const trip of parser) {
-							await this.sql.exec(
+							this.sql.exec(
 								`INSERT OR REPLACE INTO trips
 								(route_id, trip_id, service_id, trip_headsign, direction_id, shape_id)
 								VALUES (?, ?, ?, ?, ?, ?)`,
@@ -366,7 +357,7 @@ export class MtaStateObject extends DurableObject {
 
 			// Update the last update timestamp
 			const now = Temporal.Now.instant();
-			await this.sql.exec(
+			this.sql.exec(
 				"INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
 				"last_gtfs_update",
 				now.toString(),
