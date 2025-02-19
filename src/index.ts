@@ -24,7 +24,7 @@ const zipFromBuffer = (buf: Buffer, opts: yauzl.Options) =>
 	new Promise<yauzl.ZipFile>((resolve, reject) =>
 		yauzl.fromBuffer(buf, opts, (err, archive) => {
 			if (err) reject(err);
-			else resolve(archive!);
+			else resolve(archive);
 		}),
 	);
 
@@ -71,7 +71,7 @@ const MTA_SUPPLEMENTED_GTFS_STATIC_URL =
 export class MtaStateObject extends DurableObject {
 	sql: SqlStorage;
 
-	constructor(state: DurableObjectState, env: any) {
+	constructor(state: DurableObjectState, env: Env) {
 		super(state, env);
 
 		// Get the SQL storage interface.
@@ -160,6 +160,11 @@ export class MtaStateObject extends DurableObject {
       CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times(stop_id);
       CREATE INDEX IF NOT EXISTS idx_trips_route_id ON trips(route_id);
       CREATE INDEX IF NOT EXISTS idx_stops_parent_station ON stops(parent_station);
+
+      CREATE TABLE IF NOT EXISTS metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
     `);
 	}
 
@@ -190,7 +195,23 @@ export class MtaStateObject extends DurableObject {
 	/**
 	 * Loads data from the GTFS zip file into SQL.
 	 */
+	private async shouldUpdateGtfs(): Promise<boolean> {
+		const cursor = this.sql.exec<{ value: string }>(
+			"SELECT value FROM metadata WHERE key = 'last_gtfs_update'"
+		);
+		const rows = cursor.toArray();
+		if (rows.length === 0) return true;
+
+		const lastUpdate = Temporal.Instant.from(rows[0].value);
+		const now = Temporal.Now.instant();
+		const diff = now.since(lastUpdate);
+		return diff.hours >= 1;
+	}
+
 	async loadGtfsStatic() {
+		if (!await this.shouldUpdateGtfs()) {
+			return;
+		}
 		try {
 			const gtfsResponse = await fetch(MTA_SUPPLEMENTED_GTFS_STATIC_URL);
 			const buf = Buffer.from(await gtfsResponse.arrayBuffer());
@@ -342,9 +363,17 @@ export class MtaStateObject extends DurableObject {
 					trip.shape_id,
 				);
 			}
+
+			// Update the last update timestamp
+			const now = Temporal.Now.instant();
+			this.sql.exec(
+				"INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+				'last_gtfs_update',
+				now.toString()
+			);
 		} catch (err) {
 			console.error(err);
-			throw err;
+			throw err instanceof Error ? err : new Error(String(err));
 		}
 	}
 
@@ -370,8 +399,9 @@ export class MtaStateObject extends DurableObject {
 			return new Response(JSON.stringify(routes), {
 				headers: { "Content-Type": "application/json" },
 			});
-		} catch (e: any) {
-			return new Response(`Error: ${e.message}`, { status: 500 });
+		} catch (e) {
+			const error = e as Error;
+			return new Response(`Error: ${error.message}`, { status: 500 });
 		}
 	}
 
@@ -418,8 +448,8 @@ export class MtaStateObject extends DurableObject {
 			return new Response(JSON.stringify(stopsResult), {
 				headers: { "Content-Type": "application/json" },
 			});
-		} catch (e: any) {
-			return new Response(`Error: ${e.message}`, { status: 500 });
+		} catch (e) {
+			return new Response(`Error: ${e}`, { status: 500 });
 		}
 	}
 
@@ -443,8 +473,8 @@ export class MtaStateObject extends DurableObject {
 			return new Response(JSON.stringify(rows[0]), {
 				headers: { "Content-Type": "application/json" },
 			});
-		} catch (e: any) {
-			return new Response(`Error: ${e.message}`, { status: 500 });
+		} catch (e) {
+			return new Response(`Error: ${e}`, { status: 500 });
 		}
 	}
 
@@ -540,8 +570,8 @@ export class MtaStateObject extends DurableObject {
 			return new Response(JSON.stringify(upcoming), {
 				headers: { "Content-Type": "application/json" },
 			});
-		} catch (e: any) {
-			return new Response(`Error: ${e.message}`, { status: 500 });
+		} catch (e) {
+			return new Response(`Error: ${e}`, { status: 500 });
 		}
 	}
 
