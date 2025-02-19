@@ -416,39 +416,33 @@ export class MtaStateObject extends DurableObject {
 		}
 		try {
 			type TripRow = { trip_id: string };
-			const tripCursor = this.sql.exec<TripRow>(
-				"SELECT trip_id FROM trips WHERE route_id = ?",
-				lineId,
-			);
-			const trips = tripCursor.toArray();
-			if (trips.length === 0) {
-				return new Response("No trips for line", { status: 404 });
-			}
-			const tripIds = trips.map((t) => t.trip_id);
-
-			// Build the OR clause (safe because bindings are used)
-			const orClause = tripIds.map(() => "trip_id = ?").join(" OR ");
 			type StopIdRow = { stop_id: string };
 			const stopIdCursor = this.sql.exec<StopIdRow>(
-				`SELECT DISTINCT stop_id FROM stop_times
-         WHERE ${orClause}`,
-				...tripIds,
+				`SELECT DISTINCT st.stop_id 
+				 FROM stop_times st
+				 INNER JOIN trips t ON t.trip_id = st.trip_id
+				 WHERE t.route_id = ?`,
+				lineId
 			);
 			const stopRows = stopIdCursor.toArray();
-			const stationIds = stopRows.map((row) => row.stop_id);
+			const stationIds = stopRows.map(row => row.stop_id);
 			if (stationIds.length === 0) {
 				return new Response("No stations found", { status: 404 });
 			}
-			const placeholders = stationIds.map(() => "?").join(",");
 			const stopsCursor = this.sql.exec(
-				`SELECT * FROM stops WHERE stop_id IN (${placeholders})`,
-				stationIds,
+				`SELECT DISTINCT s.* 
+				 FROM stops s
+				 INNER JOIN stop_times st ON st.stop_id = s.stop_id
+				 INNER JOIN trips t ON t.trip_id = st.trip_id
+				 WHERE t.route_id = ?`,
+				lineId
 			);
 			const stopsResult = stopsCursor.toArray();
 			return new Response(JSON.stringify(stopsResult), {
 				headers: { "Content-Type": "application/json" },
 			});
 		} catch (e) {
+      console.error(e);
 			return new Response(`Error: ${e}`, { status: 500 });
 		}
 	}
