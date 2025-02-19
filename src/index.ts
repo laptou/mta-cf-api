@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { parse } from "csv-parse/sync";
+import { parse } from "csv-parse";
 import { Temporal } from "temporal-polyfill";
 import yauzl from "yauzl";
 
@@ -28,39 +28,48 @@ const zipFromBuffer = (buf: Buffer, opts: yauzl.Options) =>
 		}),
 	);
 
-async function readZipEntries(
+async function* processZipEntries(
 	zip: yauzl.ZipFile,
-): Promise<Map<string, string>> {
-	return new Promise((resolve, reject) => {
-		const entries = new Map<string, string>();
-		zip.on("error", reject);
-		zip.on("entry", (entry: yauzl.Entry) => {
-			// Skip shapes.txt if present.
-			if (entry.fileName === "shapes.txt") {
-				zip.readEntry();
-				return;
+): AsyncGenerator<[string, NodeJS.ReadableStream]> {
+	return new Promise<AsyncGenerator<[string, NodeJS.ReadableStream]>>(
+		async (resolve, reject) => {
+			try {
+				const generator = (async function* () {
+					while (true) {
+						const entry: yauzl.Entry = await new Promise((resolve, reject) => {
+							zip.once("entry", resolve);
+							zip.once("end", () => resolve(null));
+							zip.once("error", reject);
+						});
+
+						if (!entry) break;
+
+						// Skip shapes.txt if present
+						if (entry.fileName === "shapes.txt") {
+							zip.readEntry();
+							continue;
+						}
+
+						const stream = await new Promise<NodeJS.ReadableStream>(
+							(resolve, reject) => {
+								zip.openReadStream(entry, (err, stream) => {
+									if (err) reject(err);
+									else resolve(stream);
+								});
+							},
+						);
+
+						yield [entry.fileName, stream];
+						zip.readEntry();
+					}
+				})();
+
+				resolve(generator);
+			} catch (err) {
+				reject(err);
 			}
-
-			zip.openReadStream(entry, (err, stream) => {
-				if (err) {
-					reject(err);
-					return;
-				}
-				const chunks: Buffer[] = [];
-
-				stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-
-				stream.on("end", () => {
-					entries.set(entry.fileName, Buffer.concat(chunks).toString("utf-8"));
-					zip.readEntry();
-				});
-
-				stream.once("error", reject);
-			});
-		});
-		zip.on("end", () => resolve(entries));
-		zip.readEntry();
-	});
+		},
+	);
 }
 
 const MTA_SUPPLEMENTED_GTFS_STATIC_URL =
@@ -197,7 +206,7 @@ export class MtaStateObject extends DurableObject {
 	 */
 	private async shouldUpdateGtfs(): Promise<boolean> {
 		const cursor = this.sql.exec<{ value: string }>(
-			"SELECT value FROM metadata WHERE key = 'last_gtfs_update'"
+			"SELECT value FROM metadata WHERE key = 'last_gtfs_update'",
 		);
 		const rows = cursor.toArray();
 		if (rows.length === 0) return true;
@@ -209,167 +218,158 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	async loadGtfsStatic() {
-		if (!await this.shouldUpdateGtfs()) {
+		if (!(await this.shouldUpdateGtfs())) {
 			return;
 		}
+
+		console.log("updating static gtfs");
+
 		try {
 			const gtfsResponse = await fetch(MTA_SUPPLEMENTED_GTFS_STATIC_URL);
 			const buf = Buffer.from(await gtfsResponse.arrayBuffer());
 			const gtfsArchive = await zipFromBuffer(buf, { lazyEntries: true });
-			const entries = await readZipEntries(gtfsArchive);
+			const entries = await processZipEntries(gtfsArchive);
 
-			const parseCsvFile = <T>(filename: string): T[] => {
-				const text = entries.get(filename);
-				if (!text) {
-					throw new Error(`File ${filename} not found in zip`);
-				}
-
-				return parse(text, {
+			for await (const [fileName, stream] of entries) {
+				const parser = parse({
 					columns: true,
 					skip_empty_lines: true,
 				});
-			};
 
-			// Process calendar.txt.
-			const rawCalendar = parseCsvFile<
-				Record<string, string> & { start_date: string; end_date: string }
-			>("calendar.txt");
+				stream.pipe(parser);
 
-			for (const entry of rawCalendar) {
-				this.sql.exec(
-					`INSERT OR REPLACE INTO calendar
-           (service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				switch (fileName) {
+					case "calendar.txt":
+						for await (const entry of parser) {
+							await this.sql.exec(
+								`INSERT OR REPLACE INTO calendar
+								(service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date)
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								entry.service_id,
+								Number.parseInt(entry.monday, 10),
+								Number.parseInt(entry.tuesday, 10),
+								Number.parseInt(entry.wednesday, 10),
+								Number.parseInt(entry.thursday, 10),
+								Number.parseInt(entry.friday, 10),
+								Number.parseInt(entry.saturday, 10),
+								Number.parseInt(entry.sunday, 10),
+								entry.start_date,
+								entry.end_date,
+							);
+						}
+						break;
 
-					entry.service_id,
-					Number.parseInt(entry.monday, 10),
-					Number.parseInt(entry.tuesday, 10),
-					Number.parseInt(entry.wednesday, 10),
-					Number.parseInt(entry.thursday, 10),
-					Number.parseInt(entry.friday, 10),
-					Number.parseInt(entry.saturday, 10),
-					Number.parseInt(entry.sunday, 10),
-					entry.start_date,
-					entry.end_date,
-				);
-			}
+					case "calendar_dates.txt":
+						for await (const entry of parser) {
+							await this.sql.exec(
+								`INSERT OR REPLACE INTO calendar_dates
+								(service_id, date, exception_type)
+								VALUES (?, ?, ?)`,
+								entry.service_id,
+								entry.date,
+								Number(entry.exception_type),
+							);
+						}
+						break;
 
-			// Process calendar_dates.txt.
-			const rawCalendarDates =
-				parseCsvFile<Record<string, string>>("calendar_dates.txt");
-			for (const entry of rawCalendarDates) {
-				this.sql.exec(
-					`INSERT OR REPLACE INTO calendar_dates
-           (service_id, date, exception_type)
-           VALUES (?, ?, ?)`,
-					entry.service_id,
-					entry.date,
-					Number(entry.exception_type),
-				);
-			}
+					case "routes.txt":
+						for await (const route of parser) {
+							await this.sql.exec(
+								`INSERT OR REPLACE INTO routes
+								(route_id, agency_id, route_short_name, route_long_name, route_type,
+								route_desc, route_url, route_color, route_text_color)
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								route.route_id,
+								route.agency_id,
+								route.route_short_name,
+								route.route_long_name,
+								Number(route.route_type),
+								route.route_desc || null,
+								route.route_url || null,
+								route.route_color || null,
+								route.route_text_color || null,
+							);
+						}
+						break;
 
-			// Process routes.txt.
-			const routes = parseCsvFile<Record<string, string>>("routes.txt");
-			for (const route of routes) {
-				this.sql.exec(
-					`INSERT OR REPLACE INTO routes
-           (route_id, agency_id, route_short_name, route_long_name, route_type,
-            route_desc, route_url, route_color, route_text_color)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					route.route_id,
-					route.agency_id,
-					route.route_short_name,
-					route.route_long_name,
-					Number(route.route_type),
-					route.route_desc || null,
-					route.route_url || null,
-					route.route_color || null,
-					route.route_text_color || null,
-				);
-			}
+					case "stop_times.txt":
+						for await (const entry of parser) {
+							const [aH, aM, aS] = parseGtfsTime(entry.arrival_time);
+							const [dH, dM, dS] = parseGtfsTime(entry.departure_time);
+							await this.sql.exec(
+								`INSERT OR REPLACE INTO stop_times
+								(trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds,
+								departure_hours, departure_minutes, departure_seconds, stop_sequence)
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								entry.trip_id,
+								entry.stop_id,
+								aH,
+								aM,
+								aS,
+								dH,
+								dM,
+								dS,
+								Number(entry.stop_sequence),
+							);
+						}
+						break;
 
-			// Process stop_times.txt.
-			const rawStopTimes = parseCsvFile<
-				Record<string, string> & {
-					arrival_time: string;
-					departure_time: string;
-					stop_sequence: string;
+					case "stops.txt":
+						for await (const stop of parser) {
+							await this.sql.exec(
+								`INSERT OR REPLACE INTO stops
+								(stop_id, stop_name, stop_lat, stop_lon, location_type, parent_station)
+								VALUES (?, ?, ?, ?, ?, ?)`,
+								stop.stop_id,
+								stop.stop_name,
+								Number(stop.stop_lat),
+								Number(stop.stop_lon),
+								stop.location_type ? Number(stop.location_type) : null,
+								stop.parent_station || null,
+							);
+						}
+						break;
+
+					case "transfers.txt":
+						for await (const transfer of parser) {
+							await this.sql.exec(
+								`INSERT OR REPLACE INTO transfers
+								(from_stop_id, to_stop_id, transfer_type, min_transfer_time)
+								VALUES (?, ?, ?, ?)`,
+								transfer.from_stop_id,
+								transfer.to_stop_id,
+								Number(transfer.transfer_type),
+								transfer.min_transfer_time
+									? Number(transfer.min_transfer_time)
+									: null,
+							);
+						}
+						break;
+
+					case "trips.txt":
+						for await (const trip of parser) {
+							await this.sql.exec(
+								`INSERT OR REPLACE INTO trips
+								(route_id, trip_id, service_id, trip_headsign, direction_id, shape_id)
+								VALUES (?, ?, ?, ?, ?, ?)`,
+								trip.route_id,
+								trip.trip_id,
+								trip.service_id,
+								trip.trip_headsign,
+								trip.direction_id,
+								trip.shape_id,
+							);
+						}
+						break;
 				}
-			>("stop_times.txt");
-			for (const entry of rawStopTimes) {
-				const [aH, aM, aS] = parseGtfsTime(entry.arrival_time);
-				const [dH, dM, dS] = parseGtfsTime(entry.departure_time);
-				this.sql.exec(
-					`INSERT OR REPLACE INTO stop_times
-           (trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds,
-            departure_hours, departure_minutes, departure_seconds, stop_sequence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					entry.trip_id,
-					entry.stop_id,
-					aH,
-					aM,
-					aS,
-					dH,
-					dM,
-					dS,
-					Number(entry.stop_sequence),
-				);
-			}
-
-			// Process stops.txt.
-			const stops = parseCsvFile<Record<string, string>>("stops.txt");
-			for (const stop of stops) {
-				this.sql.exec(
-					`INSERT OR REPLACE INTO stops
-           (stop_id, stop_name, stop_lat, stop_lon, location_type, parent_station)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-					stop.stop_id,
-					stop.stop_name,
-					Number(stop.stop_lat),
-					Number(stop.stop_lon),
-					stop.location_type ? Number(stop.location_type) : null,
-					stop.parent_station || null,
-				);
-			}
-
-			// Process transfers.txt.
-			const transfers = parseCsvFile<Record<string, string>>("transfers.txt");
-			for (const transfer of transfers) {
-				this.sql.exec(
-					`INSERT OR REPLACE INTO transfers
-           (from_stop_id, to_stop_id, transfer_type, min_transfer_time)
-           VALUES (?, ?, ?, ?)`,
-					transfer.from_stop_id,
-					transfer.to_stop_id,
-					Number(transfer.transfer_type),
-					transfer.min_transfer_time
-						? Number(transfer.min_transfer_time)
-						: null,
-				);
-			}
-
-			// Process trips.txt.
-			const trips = parseCsvFile<Record<string, string>>("trips.txt");
-			for (const trip of trips) {
-				this.sql.exec(
-					`INSERT OR REPLACE INTO trips
-           (route_id, trip_id, service_id, trip_headsign, direction_id, shape_id)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-					trip.route_id,
-					trip.trip_id,
-					trip.service_id,
-					trip.trip_headsign,
-					trip.direction_id,
-					trip.shape_id,
-				);
 			}
 
 			// Update the last update timestamp
 			const now = Temporal.Now.instant();
-			this.sql.exec(
+			await this.sql.exec(
 				"INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-				'last_gtfs_update',
-				now.toString()
+				"last_gtfs_update",
+				now.toString(),
 			);
 		} catch (err) {
 			console.error(err);
@@ -422,10 +422,10 @@ export class MtaStateObject extends DurableObject {
 				 FROM stop_times st
 				 INNER JOIN trips t ON t.trip_id = st.trip_id
 				 WHERE t.route_id = ?`,
-				lineId
+				lineId,
 			);
 			const stopRows = stopIdCursor.toArray();
-			const stationIds = stopRows.map(row => row.stop_id);
+			const stationIds = stopRows.map((row) => row.stop_id);
 			if (stationIds.length === 0) {
 				return new Response("No stations found", { status: 404 });
 			}
@@ -435,14 +435,14 @@ export class MtaStateObject extends DurableObject {
 				 INNER JOIN stop_times st ON st.stop_id = s.stop_id
 				 INNER JOIN trips t ON t.trip_id = st.trip_id
 				 WHERE t.route_id = ?`,
-				lineId
+				lineId,
 			);
 			const stopsResult = stopsCursor.toArray();
 			return new Response(JSON.stringify(stopsResult), {
 				headers: { "Content-Type": "application/json" },
 			});
 		} catch (e) {
-      console.error(e);
+			console.error(e);
 			return new Response(`Error: ${e}`, { status: 500 });
 		}
 	}
@@ -523,7 +523,7 @@ export class MtaStateObject extends DurableObject {
          )
          ORDER BY st.arrival_hours, st.arrival_minutes, st.arrival_seconds`,
 				stationId,
-				stationId
+				stationId,
 			);
 			const rows = arrivalCursor.toArray();
 			const now = Temporal.Now.plainTimeISO();
