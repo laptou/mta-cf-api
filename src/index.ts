@@ -502,6 +502,7 @@ export class MtaStateObject extends DurableObject {
 			type ArrivalRow = {
 				trip_id: string;
 				stop_id: string;
+				stop_name: string;
 				arrival_hours: number;
 				arrival_minutes: number;
 				arrival_seconds: number;
@@ -513,18 +514,24 @@ export class MtaStateObject extends DurableObject {
 				service_id: string;
 			};
 			const arrivalCursor = this.sql.exec<ArrivalRow>(
-				`SELECT st.*, t.route_id, t.service_id
+				`SELECT st.*, t.route_id, t.service_id, s.stop_name
          FROM stop_times st
          JOIN trips t ON t.trip_id = st.trip_id
-         WHERE st.stop_id = ?
+         JOIN stops s ON s.stop_id = st.stop_id
+         WHERE st.stop_id = ? OR st.stop_id IN (
+           SELECT stop_id FROM stops WHERE parent_station = ?
+         )
          ORDER BY st.arrival_hours, st.arrival_minutes, st.arrival_seconds`,
 				stationId,
+				stationId
 			);
 			const rows = arrivalCursor.toArray();
 			const now = Temporal.Now.plainTimeISO();
 			const upcoming: {
 				line: string;
 				tripId: string;
+				stopId: string;
+				stopName: string;
 				arrivalTime: Temporal.PlainTime;
 				departureTime: Temporal.PlainTime;
 				stopSequence: number;
@@ -550,6 +557,8 @@ export class MtaStateObject extends DurableObject {
 				upcoming.push({
 					line: row.route_id,
 					tripId: row.trip_id,
+					stopId: row.stop_id,
+					stopName: row.stop_name,
 					arrivalTime,
 					departureTime: Temporal.PlainTime.from({
 						hour: row.departure_hours,
