@@ -23,45 +23,6 @@ function parseGtfsDate(date: string): Temporal.PlainDate {
 	return new Temporal.PlainDate(year, month, day);
 }
 
-const zipFromBuffer = (buf: Buffer, opts: yauzl.Options) =>
-	new Promise<yauzl.ZipFile>((resolve, reject) =>
-		yauzl.fromBuffer(buf, opts, (err, archive) => {
-			if (err) reject(err);
-			else resolve(archive);
-		}),
-	);
-
-async function* processZipEntries(
-	zip: yauzl.ZipFile,
-): AsyncGenerator<[string, NodeJS.ReadableStream]> {
-	while (true) {
-		const entry: yauzl.Entry | null = await new Promise((resolve, reject) => {
-			zip.once("entry", resolve);
-			zip.once("end", () => resolve(null));
-			zip.once("error", reject);
-			zip.readEntry();
-		});
-
-		if (!entry) break;
-
-		// Skip shapes.txt if present
-		if (entry.fileName === "shapes.txt") {
-			continue;
-		}
-
-		const stream = await new Promise<NodeJS.ReadableStream>(
-			(resolve, reject) => {
-				zip.openReadStream(entry, (err, stream) => {
-					if (err) reject(err);
-					else resolve(stream);
-				});
-			},
-		);
-
-		yield [entry.fileName, stream];
-	}
-}
-
 const MTA_SUPPLEMENTED_GTFS_STATIC_URL =
 	"https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip";
 
@@ -169,6 +130,8 @@ export class MtaStateObject extends DurableObject {
 
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
+		console.log("handling response", url.pathname);
+
 		let response: Response;
 		switch (url.pathname) {
 			case "/lines":
@@ -221,55 +184,9 @@ export class MtaStateObject extends DurableObject {
 			const gtfsResponse = await fetch(MTA_SUPPLEMENTED_GTFS_STATIC_URL);
 			const buf = await gtfsResponse.bytes();
 
-			const rowCounts = new Map<string, number>();
+			unpack_csv_archive(buf, 50_000, this.sql.exec.bind(this.sql));
 
-			unpack_csv_archive(
-				buf,
-				100_000,
-				(fileName: string, headers: string[], chunkRows: string[][]) => {
-					let totalCountForFile = rowCounts.get(fileName) ?? 0;
-					totalCountForFile += chunkRows.length;
-					rowCounts.set(fileName, totalCountForFile);
-
-					console.log(
-						`processing ${chunkRows.length} rows (${totalCountForFile} total) from ${fileName}`,
-					);
-
-					// Create a map of header to column index
-					const headerIndices = headers.reduce(
-						(acc: Record<string, number>, header, index) => {
-							acc[header] = index;
-							return acc;
-						},
-						{},
-					);
-
-					// Process each chunk of rows based on the file name
-					switch (fileName) {
-						case "calendar.txt":
-							this.processCalendarRows(chunkRows, headerIndices);
-							break;
-						case "calendar_dates.txt":
-							this.processCalendarDatesRows(chunkRows, headerIndices);
-							break;
-						case "routes.txt":
-							this.processRoutesRows(chunkRows, headerIndices);
-							break;
-						case "stop_times.txt":
-							this.processStopTimesRows(chunkRows, headerIndices);
-							break;
-						case "stops.txt":
-							this.processStopsRows(chunkRows, headerIndices);
-							break;
-						case "transfers.txt":
-							this.processTransfersRows(chunkRows, headerIndices);
-							break;
-						case "trips.txt":
-							this.processTripsRows(chunkRows, headerIndices);
-							break;
-					}
-				},
-			);
+			console.log("gtfs static timetable update completed");
 
 			// Update the last update timestamp
 			const now = Temporal.Now.instant();
@@ -496,6 +413,7 @@ export class MtaStateObject extends DurableObject {
 				route_color: string | null;
 				route_text_color: string | null;
 			};
+
 			const cursor = this.sql.exec<RouteRow>("SELECT * FROM routes");
 			const routes = cursor.toArray();
 			return new Response(JSON.stringify(routes), {
