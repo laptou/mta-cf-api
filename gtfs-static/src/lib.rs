@@ -233,23 +233,34 @@ fn process_stop_times_rows(
     let params = Array::new_with_length(10);
     params.set(0, query);
 
-    for record in chunk {
-        let row: StopTimesRow = record
-            .deserialize(Some(headers))
-            .context("deserialize StopTimesRow")?;
-        let (a_h, a_m, a_s) = parse_gtfs_time(&row.arrival_time).context("parse arrival_time")?;
-        let (d_h, d_m, d_s) =
-            parse_gtfs_time(&row.departure_time).context("parse departure_time")?;
+    let trip_id_idx = headers.iter().position(|h| h == "trip_id").unwrap();
+    let stop_id_idx = headers.iter().position(|h| h == "stop_id").unwrap();
+    let arrival_time_idx = headers.iter().position(|h| h == "arrival_time").unwrap();
+    let departure_time_idx = headers.iter().position(|h| h == "departure_time").unwrap();
+    let stop_sequence_idx = headers.iter().position(|h| h == "stop_sequence").unwrap();
 
-        params.set(1, JsValue::from_str(&row.trip_id));
-        params.set(2, JsValue::from_str(&row.stop_id));
+    for record in chunk {
+        let row = record.iter().collect_vec();
+
+        let trip_id = row[trip_id_idx];
+        let stop_id = row[stop_id_idx];
+        let arrival_time = row[arrival_time_idx];
+        let departure_time = row[departure_time_idx];
+        let stop_sequence = u32::from_str_radix(row[stop_sequence_idx], 10).unwrap();
+        
+        let (a_h, a_m, a_s) = parse_gtfs_time(arrival_time).context("parse arrival_time")?;
+        let (d_h, d_m, d_s) =
+            parse_gtfs_time(departure_time).context("parse departure_time")?;
+
+        params.set(1, JsValue::from_str(&trip_id));
+        params.set(2, JsValue::from_str(&stop_id));
         params.set(3, JsValue::from_f64(a_h as f64));
         params.set(4, JsValue::from_f64(a_m as f64));
         params.set(5, JsValue::from_f64(a_s as f64));
         params.set(6, JsValue::from_f64(d_h as f64));
         params.set(7, JsValue::from_f64(d_m as f64));
         params.set(8, JsValue::from_f64(d_s as f64));
-        params.set(9, JsValue::from_f64(row.stop_sequence as f64));
+        params.set(9, JsValue::from_f64(stop_sequence as f64));
 
         sql_exec
             .apply(&JsValue::NULL, &params)
