@@ -181,7 +181,7 @@ export class MtaStateObject extends DurableObject {
 				response = await this.handleGetUpcomingArrivals(url.searchParams);
 				break;
 			default:
-				response = new Response("Not found", { status: 404 });
+				response = new Response("not found", { status: 404 });
 		}
 
 		return response;
@@ -202,7 +202,8 @@ export class MtaStateObject extends DurableObject {
 		const lastUpdate = Temporal.Instant.from(rows[0].value);
 		const now = Temporal.Now.instant();
 		const diff = now.since(lastUpdate);
-		return diff.hours >= 1;
+		console.log("last gtfs update", lastUpdate.toString(), diff.toString());
+		return Temporal.Duration.compare(diff, { hours: 1 }) > 0;
 	}
 
 	async loadGtfsStatic() {
@@ -283,7 +284,10 @@ export class MtaStateObject extends DurableObject {
 						}
 						break;
 
-					case "stop_times.txt":
+					case "stop_times.txt": {
+						const start = performance.now();
+						let iter = 0;
+
 						for await (const entry of parser) {
 							const [aH, aM, aS] = parseGtfsTime(entry.arrival_time);
 							const [dH, dM, dS] = parseGtfsTime(entry.departure_time);
@@ -302,8 +306,17 @@ export class MtaStateObject extends DurableObject {
 								dS,
 								Number(entry.stop_sequence),
 							);
+
+							iter++;
+
+							if (iter % 10000 === 0) {
+								const now = performance.now();
+								console.log(`${iter} rows inserted in ${now - start}ms`);
+							}
 						}
+
 						break;
+					}
 
 					case "stops.txt":
 						for await (const stop of parser) {
