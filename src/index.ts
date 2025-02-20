@@ -4,6 +4,7 @@ import { Temporal } from "temporal-polyfill";
 import yauzl from "yauzl";
 import * as fflate from "fflate";
 import { Readable } from "node:stream";
+import { unpack_csv_archive } from "../gtfs-static/pkg/gtfs_static";
 
 // --- Helpers ---
 
@@ -209,228 +210,66 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	async loadGtfsStatic() {
-		if (!(await this.shouldUpdateGtfs())) {
-			console.log("not updating static gtfs");
-			return;
-		}
+		// if (!(await this.shouldUpdateGtfs())) {
+		// 	console.log("not updating static gtfs");
+		// 	return;
+		// }
 
 		console.log("updating static gtfs");
 
 		try {
 			const gtfsResponse = await fetch(MTA_SUPPLEMENTED_GTFS_STATIC_URL);
+			const buf = await gtfsResponse.bytes();
 
-			// const entries: Array<[string, ReadableStream]> = [];
+			const rowCounts = new Map<string, number>();
 
-			// const ar = new fflate.Unzip((file) => {
-			// 	console.log('got file', file.name);
+			unpack_csv_archive(
+				buf,
+				25_000,
+				(fileName: string, headers: string[], chunkRows: string[][]) => {
+					let totalCountForFile = rowCounts.get(fileName) ?? 0;
+					totalCountForFile += chunkRows.length;
+					rowCounts.set(fileName, totalCountForFile);
 
-			// 	entries.push([
-			// 		file.name,
-			// 		new ReadableStream({
-			// 			start(controller) {
-			// 				file.start();
-			// 				file.ondata = (err, data, final) => {
-			// 					if (err) {
-			// 						controller.error(err);
-			// 						return;
-			// 					}
+					console.log(
+						`processing ${chunkRows.length} rows (${totalCountForFile} total) from ${fileName}`,
+					);
 
-			// 					if (data) {
-			// 						controller.enqueue(data);
-			// 					}
+					// Create a map of header to column index
+					const headerIndices = headers.reduce(
+						(acc: Record<string, number>, header, index) => {
+							acc[header] = index;
+							return acc;
+						},
+						{},
+					);
 
-			// 					if (final) {
-			// 						controller.close();
-			// 					}
-			// 				};
-			// 			},
-			// 			cancel() {
-			// 				file.terminate();
-			// 			},
-			// 		}),
-			// 	]);
-			// });
-
-			// ar.push(await gtfsResponse.bytes(), true);
-			
-			const buf = Buffer.from(await gtfsResponse.arrayBuffer());
-			const gtfsArchive = await zipFromBuffer(buf, { lazyEntries: true });
-			const entries = processZipEntries(gtfsArchive);
-
-			for await (const [fileName, stream] of entries) {
-				const parser = parse({
-					columns: true,
-					skip_empty_lines: true,
-				});
-
-				stream.pipe(parser);
-
-				console.log(`processing ${fileName}`);
-
-				switch (fileName) {
-					case "calendar.txt":
-						for await (const entry of parser) {
-							this.sql.exec(
-								`INSERT OR REPLACE INTO calendar
-								(service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date)
-								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-								entry.service_id,
-								Number.parseInt(entry.monday, 10),
-								Number.parseInt(entry.tuesday, 10),
-								Number.parseInt(entry.wednesday, 10),
-								Number.parseInt(entry.thursday, 10),
-								Number.parseInt(entry.friday, 10),
-								Number.parseInt(entry.saturday, 10),
-								Number.parseInt(entry.sunday, 10),
-								entry.start_date,
-								entry.end_date,
-							);
-						}
-						break;
-
-					case "calendar_dates.txt":
-						for await (const entry of parser) {
-							this.sql.exec(
-								`INSERT OR REPLACE INTO calendar_dates
-								(service_id, date, exception_type)
-								VALUES (?, ?, ?)`,
-								entry.service_id,
-								entry.date,
-								Number(entry.exception_type),
-							);
-						}
-						break;
-
-					case "routes.txt":
-						for await (const route of parser) {
-							this.sql.exec(
-								`INSERT OR REPLACE INTO routes
-								(route_id, agency_id, route_short_name, route_long_name, route_type,
-								route_desc, route_url, route_color, route_text_color)
-								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-								route.route_id,
-								route.agency_id,
-								route.route_short_name,
-								route.route_long_name,
-								Number(route.route_type),
-								route.route_desc || null,
-								route.route_url || null,
-								route.route_color || null,
-								route.route_text_color || null,
-							);
-						}
-						break;
-
-					case "stop_times.txt": {
-						const start = performance.now();
-						let batch = [];
-						let iter = 0;
-
-						for await (const entry of parser) {
-							const [aH, aM, aS] = parseGtfsTime(entry.arrival_time);
-							const [dH, dM, dS] = parseGtfsTime(entry.departure_time);
-							const row = [
-								entry.trip_id,
-								entry.stop_id,
-								aH,
-								aM,
-								aS,
-								dH,
-								dM,
-								dS,
-								Number.parseInt(entry.stop_sequence, 10),
-							];
-
-							batch.push(row);
-
-							if (batch.length >= 1000) {
-								for (const row of batch) {
-									this.sql.exec(
-										`INSERT OR REPLACE INTO stop_times
-											(trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds,
-											departure_hours, departure_minutes, departure_seconds, stop_sequence)
-											VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-										...row,
-									);
-								}
-
-								batch = [];
-							}
-
-							iter++;
-
-							if (iter % 10000 === 0) {
-								const now = performance.now();
-								console.log(`${iter} rows inserted in ${now - start}ms`);
-							}
-						}
-
-						if (batch.length >= 1000) {
-							for (const row of batch) {
-								this.sql.exec(
-									`INSERT OR REPLACE INTO stop_times
-										(trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds,
-										departure_hours, departure_minutes, departure_seconds, stop_sequence)
-										VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-									...row,
-								);
-							}
-
-							batch = [];
-						}
-
-						break;
+					// Process each chunk of rows based on the file name
+					switch (fileName) {
+						case "calendar.txt":
+							this.processCalendarRows(chunkRows, headerIndices);
+							break;
+						case "calendar_dates.txt":
+							this.processCalendarDatesRows(chunkRows, headerIndices);
+							break;
+						case "routes.txt":
+							this.processRoutesRows(chunkRows, headerIndices);
+							break;
+						case "stop_times.txt":
+							this.processStopTimesRows(chunkRows, headerIndices);
+							break;
+						case "stops.txt":
+							this.processStopsRows(chunkRows, headerIndices);
+							break;
+						case "transfers.txt":
+							this.processTransfersRows(chunkRows, headerIndices);
+							break;
+						case "trips.txt":
+							this.processTripsRows(chunkRows, headerIndices);
+							break;
 					}
-
-					case "stops.txt":
-						for await (const stop of parser) {
-							this.sql.exec(
-								`INSERT OR REPLACE INTO stops
-								(stop_id, stop_name, stop_lat, stop_lon, location_type, parent_station)
-								VALUES (?, ?, ?, ?, ?, ?)`,
-								stop.stop_id,
-								stop.stop_name,
-								Number(stop.stop_lat),
-								Number(stop.stop_lon),
-								stop.location_type ? Number(stop.location_type) : null,
-								stop.parent_station || null,
-							);
-						}
-						break;
-
-					case "transfers.txt":
-						for await (const transfer of parser) {
-							this.sql.exec(
-								`INSERT OR REPLACE INTO transfers
-								(from_stop_id, to_stop_id, transfer_type, min_transfer_time)
-								VALUES (?, ?, ?, ?)`,
-								transfer.from_stop_id,
-								transfer.to_stop_id,
-								Number(transfer.transfer_type),
-								transfer.min_transfer_time
-									? Number(transfer.min_transfer_time)
-									: null,
-							);
-						}
-						break;
-
-					case "trips.txt":
-						for await (const trip of parser) {
-							this.sql.exec(
-								`INSERT OR REPLACE INTO trips
-								(route_id, trip_id, service_id, trip_headsign, direction_id, shape_id)
-								VALUES (?, ?, ?, ?, ?, ?)`,
-								trip.route_id,
-								trip.trip_id,
-								trip.service_id,
-								trip.trip_headsign,
-								trip.direction_id,
-								trip.shape_id,
-							);
-						}
-						break;
-				}
-			}
+				},
+			);
 
 			// Update the last update timestamp
 			const now = Temporal.Now.instant();
@@ -442,6 +281,201 @@ export class MtaStateObject extends DurableObject {
 		} catch (err) {
 			console.error(err);
 			throw err instanceof Error ? err : new Error(String(err));
+		}
+	}
+
+	processCalendarRows(
+		chunkRows: string[][],
+		headerIndices: Record<string, number>,
+	) {
+		const columns = [
+			"service_id",
+			"monday",
+			"tuesday",
+			"wednesday",
+			"thursday",
+			"friday",
+			"saturday",
+			"sunday",
+			"start_date",
+			"end_date",
+		];
+
+		for (const row of chunkRows) {
+			const values = columns.map((col) => row[headerIndices[col]]);
+			this.sql.exec(
+				`INSERT OR REPLACE INTO calendar
+            (service_id, monday, tuesday, wednesday, thursday, friday, 
+            saturday, sunday, start_date, end_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				...values.map((value) => Number(value) || null),
+			);
+		}
+	}
+
+	processCalendarDatesRows(
+		chunkRows: string[][],
+		headerIndices: Record<string, number>,
+	) {
+		const columns = ["service_id", "date", "exception_type"];
+
+		for (const row of chunkRows) {
+			const values = columns.map((col) => row[headerIndices[col]]);
+			this.sql.exec(
+				`INSERT OR REPLACE INTO calendar_dates
+            (service_id, date, exception_type)
+            VALUES (?, ?, ?)`,
+				...values,
+			);
+		}
+	}
+
+	processRoutesRows(
+		chunkRows: string[][],
+		headerIndices: Record<string, number>,
+	) {
+		const columns = [
+			"route_id",
+			"agency_id",
+			"route_short_name",
+			"route_long_name",
+			"route_type",
+			"route_desc",
+			"route_url",
+			"route_color",
+			"route_text_color",
+		];
+
+		for (const row of chunkRows) {
+			const values = columns.map((col) => {
+				const value = row[headerIndices[col]];
+				return col === "route_type" ? Number(value) : value || null;
+			});
+			this.sql.exec(
+				`INSERT OR REPLACE INTO routes
+            (route_id, agency_id, route_short_name, route_long_name,
+            route_type, route_desc, route_url, route_color, 
+            route_text_color)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				...values,
+			);
+		}
+	}
+
+	processStopTimesRows(
+		chunkRows: string[][],
+		headerIndices: Record<string, number>,
+	) {
+		const columns = [
+			"trip_id",
+			"stop_id",
+			"arrival_time",
+			"departure_time",
+			"stop_sequence",
+		];
+
+		for (const row of chunkRows) {
+			const values = columns.map((col) => row[headerIndices[col]]);
+			const [aH, aM, aS] = parseGtfsTime(values[2]);
+			const [dH, dM, dS] = parseGtfsTime(values[3]);
+
+			this.sql.exec(
+				`INSERT OR REPLACE INTO stop_times
+            (trip_id, stop_id, arrival_hours, arrival_minutes, 
+            arrival_seconds, departure_hours, departure_minutes, 
+            departure_seconds, stop_sequence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				values[0],
+				values[1],
+				aH,
+				aM,
+				aS,
+				dH,
+				dM,
+				dS,
+				Number(values[4]),
+			);
+		}
+	}
+
+	processStopsRows(
+		chunkRows: string[][],
+		headerIndices: Record<string, number>,
+	) {
+		const columns = [
+			"stop_id",
+			"stop_name",
+			"stop_lat",
+			"stop_lon",
+			"location_type",
+			"parent_station",
+		];
+
+		for (const row of chunkRows) {
+			const values = columns.map((col) => row[headerIndices[col]]);
+			this.sql.exec(
+				`INSERT OR REPLACE INTO stops
+            (stop_id, stop_name, stop_lat, stop_lon, 
+            location_type, parent_station)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+				values[0],
+				values[1],
+				Number(values[2]),
+				Number(values[3]),
+				Number(values[4]),
+				values[5] || null,
+			);
+		}
+	}
+
+	processTransfersRows(
+		chunkRows: string[][],
+		headerIndices: Record<string, number>,
+	) {
+		const columns = [
+			"from_stop_id",
+			"to_stop_id",
+			"transfer_type",
+			"min_transfer_time",
+		];
+
+		for (const row of chunkRows) {
+			const values = columns.map((col) => row[headerIndices[col]]);
+			this.sql.exec(
+				`INSERT OR REPLACE INTO transfers
+            (from_stop_id, to_stop_id, transfer_type, 
+            min_transfer_time)
+            VALUES (?, ?, ?, ?)`,
+				values[0],
+				values[1],
+				Number(values[2]),
+				Number(values[3]) || null,
+			);
+		}
+	}
+
+	processTripsRows(
+		chunkRows: string[][],
+		headerIndices: Record<string, number>,
+	) {
+		const columns = [
+			"route_id",
+			"trip_id",
+			"service_id",
+			"trip_headsign",
+			"direction_id",
+			"shape_id",
+		];
+
+		for (const row of chunkRows) {
+			const values = columns.map((col) => row[headerIndices[col]]);
+			this.sql.exec(
+				`INSERT OR REPLACE INTO trips
+            (route_id, trip_id, service_id, trip_headsign,
+            direction_id, shape_id)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+				...values,
+			);
 		}
 	}
 
