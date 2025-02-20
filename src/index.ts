@@ -4,7 +4,7 @@ import { Temporal } from "temporal-polyfill";
 import yauzl from "yauzl";
 import * as fflate from "fflate";
 import { Readable } from "node:stream";
-import { unpack_csv_archive } from "../gtfs-static/pkg/gtfs_static";
+import { unpack_csv_archive } from "../gtfs-static/pkg/gtfs_static_patched";
 
 // --- Helpers ---
 
@@ -225,7 +225,7 @@ export class MtaStateObject extends DurableObject {
 
 			unpack_csv_archive(
 				buf,
-				25_000,
+				100_000,
 				(fileName: string, headers: string[], chunkRows: string[][]) => {
 					let totalCountForFile = rowCounts.get(fileName) ?? 0;
 					totalCountForFile += chunkRows.length;

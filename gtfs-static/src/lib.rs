@@ -8,11 +8,6 @@ use js_sys::{Function, JsString, Uint8Array};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-extern "C" {
-    fn alert(s: &str);
-}
-
-#[wasm_bindgen]
 pub fn unpack_csv_archive(
     data: Uint8Array,
     row_chunk_len: usize,
