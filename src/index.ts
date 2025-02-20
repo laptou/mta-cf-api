@@ -2,6 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 import { parse } from "csv-parse";
 import { Temporal } from "temporal-polyfill";
 import yauzl from "yauzl";
+import * as fflate from "fflate";
+import { Readable } from "node:stream";
 
 // --- Helpers ---
 
@@ -216,6 +218,41 @@ export class MtaStateObject extends DurableObject {
 
 		try {
 			const gtfsResponse = await fetch(MTA_SUPPLEMENTED_GTFS_STATIC_URL);
+
+			// const entries: Array<[string, ReadableStream]> = [];
+
+			// const ar = new fflate.Unzip((file) => {
+			// 	console.log('got file', file.name);
+
+			// 	entries.push([
+			// 		file.name,
+			// 		new ReadableStream({
+			// 			start(controller) {
+			// 				file.start();
+			// 				file.ondata = (err, data, final) => {
+			// 					if (err) {
+			// 						controller.error(err);
+			// 						return;
+			// 					}
+
+			// 					if (data) {
+			// 						controller.enqueue(data);
+			// 					}
+
+			// 					if (final) {
+			// 						controller.close();
+			// 					}
+			// 				};
+			// 			},
+			// 			cancel() {
+			// 				file.terminate();
+			// 			},
+			// 		}),
+			// 	]);
+			// });
+
+			// ar.push(await gtfsResponse.bytes(), true);
+			
 			const buf = Buffer.from(await gtfsResponse.arrayBuffer());
 			const gtfsArchive = await zipFromBuffer(buf, { lazyEntries: true });
 			const entries = processZipEntries(gtfsArchive);
@@ -286,16 +323,13 @@ export class MtaStateObject extends DurableObject {
 
 					case "stop_times.txt": {
 						const start = performance.now();
+						let batch = [];
 						let iter = 0;
 
 						for await (const entry of parser) {
 							const [aH, aM, aS] = parseGtfsTime(entry.arrival_time);
 							const [dH, dM, dS] = parseGtfsTime(entry.departure_time);
-							this.sql.exec(
-								`INSERT OR REPLACE INTO stop_times
-								(trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds,
-								departure_hours, departure_minutes, departure_seconds, stop_sequence)
-								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+							const row = [
 								entry.trip_id,
 								entry.stop_id,
 								aH,
@@ -304,8 +338,24 @@ export class MtaStateObject extends DurableObject {
 								dH,
 								dM,
 								dS,
-								Number(entry.stop_sequence),
-							);
+								Number.parseInt(entry.stop_sequence, 10),
+							];
+
+							batch.push(row);
+
+							if (batch.length >= 1000) {
+								for (const row of batch) {
+									this.sql.exec(
+										`INSERT OR REPLACE INTO stop_times
+											(trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds,
+											departure_hours, departure_minutes, departure_seconds, stop_sequence)
+											VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+										...row,
+									);
+								}
+
+								batch = [];
+							}
 
 							iter++;
 
@@ -313,6 +363,20 @@ export class MtaStateObject extends DurableObject {
 								const now = performance.now();
 								console.log(`${iter} rows inserted in ${now - start}ms`);
 							}
+						}
+
+						if (batch.length >= 1000) {
+							for (const row of batch) {
+								this.sql.exec(
+									`INSERT OR REPLACE INTO stop_times
+										(trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds,
+										departure_hours, departure_minutes, departure_seconds, stop_sequence)
+										VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+									...row,
+								);
+							}
+
+							batch = [];
 						}
 
 						break;
