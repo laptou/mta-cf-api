@@ -221,7 +221,18 @@ export class MtaStateObject extends DurableObject {
 
 			const cursor = this.sql.exec<RouteRow>("SELECT * FROM routes");
 			const routes = cursor.toArray();
-			return new Response(JSON.stringify(routes), {
+			const camelCaseRoutes = routes.map((route) => ({
+				routeId: route.route_id,
+				agencyId: route.agency_id,
+				routeShortName: route.route_short_name,
+				routeLongName: route.route_long_name,
+				routeType: route.route_type,
+				routeDesc: route.route_desc,
+				routeUrl: route.route_url,
+				routeColor: route.route_color,
+				routeTextColor: route.route_text_color,
+			}));
+			return new Response(JSON.stringify(camelCaseRoutes), {
 				headers: { "Content-Type": "application/json" },
 			});
 		} catch (e) {
@@ -242,11 +253,12 @@ export class MtaStateObject extends DurableObject {
 		try {
 			type TripRow = { trip_id: string };
 			type StopIdRow = { stop_id: string };
+
 			const stopIdCursor = this.sql.exec<StopIdRow>(
-				`SELECT DISTINCT st.stop_id 
-				 FROM stop_times st
-				 INNER JOIN trips t ON t.trip_id = st.trip_id
-				 WHERE t.route_id = ?`,
+				`SELECT DISTINCT st.stop_id
+         FROM stop_times st
+         INNER JOIN trips t ON t.trip_id = st.trip_id
+         WHERE t.route_id = ?`,
 				lineId,
 			);
 			const stopRows = stopIdCursor.toArray();
@@ -255,15 +267,32 @@ export class MtaStateObject extends DurableObject {
 				return new Response("No stations found", { status: 404 });
 			}
 			const stopsCursor = this.sql.exec(
-				`SELECT DISTINCT s.* 
-				 FROM stops s
-				 INNER JOIN stop_times st ON st.stop_id = s.stop_id
-				 INNER JOIN trips t ON t.trip_id = st.trip_id
-				 WHERE t.route_id = ?`,
+				`SELECT DISTINCT s.*
+         FROM stops s
+         INNER JOIN stop_times st ON st.stop_id = s.stop_id
+         INNER JOIN trips t ON t.trip_id = st.trip_id
+         WHERE t.route_id = ?`,
 				lineId,
 			);
+
 			const stopsResult = stopsCursor.toArray();
-			return new Response(JSON.stringify(stopsResult), {
+			const camelCaseStopsResult = stopsResult.map((stop) => ({
+				stopId: stop.stop_id,
+				stopCode: stop.stop_code,
+				stopName: stop.stop_name,
+				stopDesc: stop.stop_desc,
+				stopLat: stop.stop_lat,
+				stopLon: stop.stop_lon,
+				zoneId: stop.zone_id,
+				stopUrl: stop.stop_url,
+				locationType: stop.location_type,
+				parentStation: stop.parent_station,
+				stopTimezone: stop.stop_timezone,
+				wheelchairBoarding: stop.wheelchair_boarding,
+				levelId: stop.level_id,
+				platformCode: stop.platform_code,
+			}));
+			return new Response(JSON.stringify(camelCaseStopsResult), {
 				headers: { "Content-Type": "application/json" },
 			});
 		} catch (e) {
@@ -289,7 +318,24 @@ export class MtaStateObject extends DurableObject {
 			if (rows.length === 0) {
 				return new Response("Station not found", { status: 404 });
 			}
-			return new Response(JSON.stringify(rows[0]), {
+			const stop = rows[0];
+			const camelCaseStop = {
+				stopId: stop.stop_id,
+				stopCode: stop.stop_code,
+				stopName: stop.stop_name,
+				stopDesc: stop.stop_desc,
+				stopLat: stop.stop_lat,
+				stopLon: stop.stop_lon,
+				zoneId: stop.zone_id,
+				stopUrl: stop.stop_url,
+				locationType: stop.location_type,
+				parentStation: stop.parent_station,
+				stopTimezone: stop.stop_timezone,
+				wheelchairBoarding: stop.wheelchair_boarding,
+				levelId: stop.level_id,
+				platformCode: stop.platform_code,
+			};
+			return new Response(JSON.stringify(camelCaseStop), {
 				headers: { "Content-Type": "application/json" },
 			});
 		} catch (e) {
@@ -371,13 +417,21 @@ export class MtaStateObject extends DurableObject {
 					minute: row.arrival_minutes,
 					second: row.arrival_seconds,
 				});
+
 				// Skip if arrival time is not in the future.
 				if (Temporal.PlainTime.compare(arrivalTime, now) <= 0) {
 					continue;
 				}
+
 				// Check if the service for this row is active today.
 				const isActive = await this.isServiceActiveToday(row.service_id);
 				if (!isActive) continue;
+
+				const departureTime = Temporal.PlainTime.from({
+					hour: row.departure_hours,
+					minute: row.departure_minutes,
+					second: row.departure_seconds,
+				});
 
 				upcoming.push({
 					line: row.route_id,
@@ -385,15 +439,13 @@ export class MtaStateObject extends DurableObject {
 					stopId: row.stop_id,
 					stopName: row.stop_name,
 					arrivalTime,
-					departureTime: Temporal.PlainTime.from({
-						hour: row.departure_hours,
-						minute: row.departure_minutes,
-						second: row.departure_seconds,
-					}),
+					departureTime,
 					stopSequence: row.stop_sequence,
 				});
+
 				if (upcoming.length >= limit) break;
 			}
+
 			// Return the collected upcoming arrivals.
 			return new Response(JSON.stringify(upcoming), {
 				headers: { "Content-Type": "application/json" },

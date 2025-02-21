@@ -36,3 +36,6 @@ yielded modest performance gains, and i tried using transactions, which yielded
 huge performance gains.
 
 now it loads the gtfs tables very fast, and my API is working in the cloud.
+
+- i tried reverting to a JS implementation that uses transactions. it's unusably
+  slow. so at least i didn't write all this rust for no reason.
