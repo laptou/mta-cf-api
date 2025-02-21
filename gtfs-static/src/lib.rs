@@ -5,7 +5,7 @@ mod utils;
 use anyhow::{anyhow, Context};
 use csv::StringRecord;
 use itertools::Itertools;
-use js_sys::{Array, Function, JsString, Object, Reflect, Uint8Array};
+use js_sys::{Array, Function, JsString, Object, Promise, Reflect, Uint8Array};
 use serde::Deserialize;
 use std::{io::Cursor, str};
 use wasm_bindgen::prelude::*;
@@ -219,16 +219,16 @@ fn process_stop_times_rows(
 
     let sql = storage.sql();
 
-    storage.transaction_sync(&mut || {
+    storage.transaction(&mut || {
         let query = "
         INSERT OR REPLACE INTO stop_times
-        (trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds, 
-        departure_hours, departure_minutes, departure_seconds, stop_sequence) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        (trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds, arrival_total_seconds,
+        departure_hours, departure_minutes, departure_seconds, departure_total_seconds, stop_sequence) 
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
 
         let query = &std::iter::repeat_n(query, 1).join(";");
 
-        let params = Array::new_with_length(9);
+        let params = Array::new_with_length(11);
 
         let trip_id_idx = headers.iter().position(|h| h == "trip_id").unwrap();
         let stop_id_idx = headers.iter().position(|h| h == "stop_id").unwrap();
@@ -257,15 +257,17 @@ fn process_stop_times_rows(
             params.set(2, JsValue::from_f64(a_h as f64));
             params.set(3, JsValue::from_f64(a_m as f64));
             params.set(4, JsValue::from_f64(a_s as f64));
-            params.set(5, JsValue::from_f64(d_h as f64));
-            params.set(6, JsValue::from_f64(d_m as f64));
-            params.set(7, JsValue::from_f64(d_s as f64));
-            params.set(8, JsValue::from_f64(stop_sequence as f64));
+            params.set(5, JsValue::from_f64((a_s + a_m * 60 + a_h * 3600) as f64));
+            params.set(6, JsValue::from_f64(d_h as f64));
+            params.set(7, JsValue::from_f64(d_m as f64));
+            params.set(8, JsValue::from_f64(d_s as f64));
+            params.set(9, JsValue::from_f64((d_s + d_m * 60 + d_h * 3600) as f64));
+            params.set(10, JsValue::from_f64(stop_sequence as f64));
 
             sql.exec(query, &params)?;
         }
 
-        Ok(())
+        Ok(Promise::resolve(&JsValue::undefined()))
     });
 
     // // having an index enabled while inserting 2.2 million rows is too slow
@@ -298,8 +300,7 @@ fn process_stops_rows(
     log(&format!("Processing {} stops rows", chunk.len()));
     let sql = storage.sql();
 
-    let query = 
-        "
+    let query = "
 INSERT OR REPLACE INTO stops
 (stop_id, stop_name, stop_lat, stop_lon, location_type, parent_station)
 VALUES (?, ?, ?, ?, ?, ?)";
@@ -310,7 +311,7 @@ VALUES (?, ?, ?, ?, ?, ?)";
             .context("deserialize StopsRow")?;
 
         let params = Array::new();
-        
+
         params.push(&JsValue::from_str(&row.stop_id));
         params.push(&JsValue::from_str(&row.stop_name));
         params.push(&JsValue::from_f64(row.stop_lat));
@@ -350,7 +351,7 @@ VALUES (?, ?, ?, ?)";
             .context("deserialize TransfersRow")?;
 
         let params = Array::new();
-        
+
         params.push(&JsValue::from_str(&row.from_stop_id));
         params.push(&JsValue::from_str(&row.to_stop_id));
         params.push(&JsValue::from_f64(row.transfer_type as f64));
@@ -376,8 +377,7 @@ fn process_trips_rows(
 
     let sql = storage.sql();
 
-    let query =
-        "\
+    let query = "\
 INSERT OR REPLACE INTO trips \
 (route_id, trip_id, service_id, trip_headsign, direction_id, shape_id) \
 VALUES (?, ?, ?, ?, ?, ?)";
@@ -388,7 +388,7 @@ VALUES (?, ?, ?, ?, ?, ?)";
             .context("deserialize TripsRow")?;
 
         let params = Array::new();
-        
+
         params.push(&JsValue::from_str(&row.route_id));
         params.push(&JsValue::from_str(&row.trip_id));
         params.push(&JsValue::from_str(&row.service_id));
@@ -411,8 +411,11 @@ extern "C" {
     #[wasm_bindgen(method, getter)]
     pub fn sql(this: &DurableObjectStorage) -> DurableObjectSqlStorage;
 
-    #[wasm_bindgen(method)]
-    pub fn transaction_sync(this: &DurableObjectStorage, cb: &mut dyn FnMut() -> Result<(), JsValue>);
+    #[wasm_bindgen(method, js_name = "transaction")]
+    pub fn transaction(
+        this: &DurableObjectStorage,
+        cb: &mut dyn FnMut() -> Result<Promise, JsValue>,
+    );
 
     pub type DurableObjectSqlStorage;
 

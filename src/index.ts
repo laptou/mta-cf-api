@@ -1,20 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
-import { parse } from "csv-parse";
 import { Temporal } from "temporal-polyfill";
-import yauzl from "yauzl";
-import * as fflate from "fflate";
-import { Readable } from "node:stream";
 import { unpack_csv_archive } from "../gtfs-static/pkg/gtfs_static_patched";
-
-// --- Helpers ---
-
-function parseGtfsTime(time: string): [number, number, number] {
-	const hours = Number.parseInt(time.slice(0, 2), 10);
-	const minutes = Number.parseInt(time.slice(3, 5), 10);
-	const seconds = Number.parseInt(time.slice(6, 8), 10);
-	// Wrap hours past midnight into 0-23
-	return [hours % 24, minutes, seconds];
-}
 
 function parseGtfsDate(date: string): Temporal.PlainDate {
 	const year = Number.parseInt(date.slice(0, 4), 10);
@@ -25,8 +11,6 @@ function parseGtfsDate(date: string): Temporal.PlainDate {
 
 const MTA_SUPPLEMENTED_GTFS_STATIC_URL =
 	"https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip";
-
-// --- Durable Object Implementation ---
 
 export class MtaStateObject extends DurableObject {
 	sql: SqlStorage;
@@ -84,9 +68,11 @@ export class MtaStateObject extends DurableObject {
         arrival_hours INTEGER,
         arrival_minutes INTEGER,
         arrival_seconds INTEGER,
+				arrival_total_seconds INTEGER,
         departure_hours INTEGER,
         departure_minutes INTEGER,
         departure_seconds INTEGER,
+				departure_total_seconds INTEGER,
         stop_sequence INTEGER,
         PRIMARY KEY (trip_id, stop_id)
       );
@@ -173,10 +159,10 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	async loadGtfsStatic() {
-		if (!(await this.shouldUpdateGtfs())) {
-			console.log("not updating static gtfs");
-			return;
-		}
+		// if (!(await this.shouldUpdateGtfs())) {
+		// 	console.log("not updating static gtfs");
+		// 	return;
+		// }
 
 		console.log("updating static gtfs");
 
@@ -248,30 +234,30 @@ export class MtaStateObject extends DurableObject {
 	async handleGetStationsForLine(params: URLSearchParams): Promise<Response> {
 		const lineId = params.get("lineId");
 		if (!lineId) {
-			return new Response("Missing lineId parameter", { status: 400 });
+			return new Response("missing lineId parameter", { status: 400 });
 		}
-		try {
-			type TripRow = { trip_id: string };
-			type StopIdRow = { stop_id: string };
 
-			const stopIdCursor = this.sql.exec<StopIdRow>(
-				`SELECT DISTINCT st.stop_id
-         FROM stop_times st
-         INNER JOIN trips t ON t.trip_id = st.trip_id
-         WHERE t.route_id = ?`,
-				lineId,
-			);
-			const stopRows = stopIdCursor.toArray();
-			const stationIds = stopRows.map((row) => row.stop_id);
-			if (stationIds.length === 0) {
-				return new Response("No stations found", { status: 404 });
-			}
+		try {
 			const stopsCursor = this.sql.exec(
-				`SELECT DISTINCT s.*
-         FROM stops s
-         INNER JOIN stop_times st ON st.stop_id = s.stop_id
-         INNER JOIN trips t ON t.trip_id = st.trip_id
-         WHERE t.route_id = ?`,
+				`
+				SELECT DISTINCT s.*
+				FROM stops s
+				WHERE s.stop_id IN (
+					SELECT st.stop_id
+					FROM stop_times st
+					JOIN trips t ON t.trip_id = st.trip_id
+					WHERE t.route_id = ?
+				)
+				OR s.stop_id IN (
+					SELECT DISTINCT s2.parent_station
+					FROM stops s2
+					JOIN stop_times st ON st.stop_id = s2.stop_id
+					JOIN trips t ON t.trip_id = st.trip_id
+					WHERE t.route_id = ?
+						AND s2.parent_station IS NOT NULL
+				)
+				`,
+				lineId,
 				lineId,
 			);
 
@@ -292,6 +278,7 @@ export class MtaStateObject extends DurableObject {
 				levelId: stop.level_id,
 				platformCode: stop.platform_code,
 			}));
+
 			return new Response(JSON.stringify(camelCaseStopsResult), {
 				headers: { "Content-Type": "application/json" },
 			});
@@ -314,10 +301,12 @@ export class MtaStateObject extends DurableObject {
 				"SELECT * FROM stops WHERE stop_id = ?",
 				stationId,
 			);
+
 			const rows = cursor.toArray();
 			if (rows.length === 0) {
-				return new Response("Station not found", { status: 404 });
+				return new Response("station not found", { status: 404 });
 			}
+
 			const stop = rows[0];
 			const camelCaseStop = {
 				stopId: stop.stop_id,
@@ -350,24 +339,29 @@ export class MtaStateObject extends DurableObject {
 	 */
 	async handleGetUpcomingArrivals(params: URLSearchParams): Promise<Response> {
 		const stationId = params.get("stationId");
+		const lineId = params.get("lineId");
+
 		if (!stationId) {
-			return new Response("Missing stationId parameter", { status: 400 });
+			return new Response("missing stationId parameter", { status: 400 });
 		}
-		// direction is optional. In a full implementation you might map a station to
-		// multiple stops based on direction; here we assume stationId matches a stop_id.
-		const direction = params.get("direction");
-		const limit = params.get("limit") ? Number(params.get("limit")) : 10;
+
+		const limit = Math.min(
+			params.get("limit") ? Number(params.get("limit")) : 10,
+			15,
+		);
 
 		try {
 			// Get the stop details for the given stationId.
 			const stopCursor = this.sql.exec(
-				"SELECT * FROM stops WHERE stop_id = ?",
+				"SELECT * FROM stops WHERE stop_id = $1 OR parent_station = $1",
 				stationId,
 			);
 			const stops = stopCursor.toArray();
+
 			if (stops.length === 0) {
-				return new Response("Station not found", { status: 404 });
+				return new Response("station not found", { status: 404 });
 			}
+
 			// Use the provided stationId as the stop_id.
 			// Get all upcoming stop_times for that stop joined with trips.
 			type ArrivalRow = {
@@ -384,20 +378,44 @@ export class MtaStateObject extends DurableObject {
 				route_id: string;
 				service_id: string;
 			};
-			const arrivalCursor = this.sql.exec<ArrivalRow>(
-				`SELECT st.*, t.route_id, t.service_id, s.stop_name
+
+			const now = Temporal.Now.plainTimeISO();
+			const nowTotalSeconds = now
+				.since(Temporal.PlainTime.from("00:00:00"))
+				.total("second") | 0;
+
+			console.log({ now, nowTotalSeconds });
+
+			const arrivalCursor = lineId
+				? this.sql.exec<ArrivalRow>(
+						`SELECT st.*, t.route_id, t.service_id, s.stop_name
+						FROM stop_times st
+						JOIN trips t ON t.trip_id = st.trip_id
+						JOIN stops s ON s.stop_id = st.stop_id
+						WHERE (s.stop_id = $1 or s.parent_station = $1) AND t.route_id = $2 AND st.arrival_total_seconds >= $4
+						ORDER BY st.arrival_total_seconds,
+						LIMIT $3`,
+						stationId,
+						lineId,
+						// double the limit to account for services that aren't active today
+						limit * 2,
+						nowTotalSeconds,
+					)
+				: this.sql.exec<ArrivalRow>(
+						`SELECT st.*, t.route_id, t.service_id, s.stop_name
          FROM stop_times st
          JOIN trips t ON t.trip_id = st.trip_id
          JOIN stops s ON s.stop_id = st.stop_id
-         WHERE st.stop_id = ? OR st.stop_id IN (
-           SELECT stop_id FROM stops WHERE parent_station = ?
-         )
-         ORDER BY st.arrival_hours, st.arrival_minutes, st.arrival_seconds`,
-				stationId,
-				stationId,
-			);
+         WHERE s.stop_id = $1 or s.parent_station = $1 AND st.arrival_total_seconds >= $3
+         ORDER BY st.arrival_total_seconds
+				 LIMIT $2`,
+						stationId,
+						// double the limit to account for services that aren't active today
+						limit * 2,
+						nowTotalSeconds,
+					);
+
 			const rows = arrivalCursor.toArray();
-			const now = Temporal.Now.plainTimeISO();
 			const upcoming: {
 				line: string;
 				tripId: string;
@@ -417,11 +435,6 @@ export class MtaStateObject extends DurableObject {
 					minute: row.arrival_minutes,
 					second: row.arrival_seconds,
 				});
-
-				// Skip if arrival time is not in the future.
-				if (Temporal.PlainTime.compare(arrivalTime, now) <= 0) {
-					continue;
-				}
 
 				// Check if the service for this row is active today.
 				const isActive = await this.isServiceActiveToday(row.service_id);
