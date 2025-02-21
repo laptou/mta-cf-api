@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { Temporal } from "temporal-polyfill";
-import { unpack_csv_archive } from "../gtfs-static/pkg/gtfs_static_patched";
+import { unpackCsvArchive } from "../gtfs-importer/binding";
 
 function parseGtfsDate(date: string): Temporal.PlainDate {
 	const year = Number.parseInt(date.slice(0, 4), 10);
@@ -170,7 +170,7 @@ export class MtaStateObject extends DurableObject {
 			const gtfsResponse = await fetch(MTA_SUPPLEMENTED_GTFS_STATIC_URL);
 			const buf = await gtfsResponse.bytes();
 
-			unpack_csv_archive(buf, 50_000, this.ctx.storage);
+			unpackCsvArchive(buf, 50_000, this.ctx.storage);
 
 			console.log("gtfs static timetable update completed");
 

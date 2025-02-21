@@ -1,5 +1,5 @@
 [package]
-name = "gtfs-static"
+name = "gtfs-importer"
 version = "0.1.0"
 authors = ["Ibiyemi Abiodun <ibiyemi@intulon.com>"]
 edition = "2021"
