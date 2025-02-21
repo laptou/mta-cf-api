@@ -24,3 +24,15 @@ Error: To execute a transaction, please use the state.storage.transaction() or s
 - it's still insanely fast. just recorded 3910ms.
 
 - IT WORKS IN THE CLOUD!!
+
+so to recap, i build a static gtfs timetable importer. it was too slow, so
+cloudflare was killing the durable object while it was trying to fill up the
+database. i assumed that the bottleneck was in zipping & unzipping, so i tried a
+different zip library, and then i tried performing the unzipping in rust. this
+yielded some modest performance gains, but it still wasn't fast enough, so i
+profiled it. profiling revealed that most of the time was actually spent in the
+sqlite.exec call and not in decompression, so i tried disabling the index, which
+yielded modest performance gains, and i tried using transactions, which yielded
+huge performance gains.
+
+now it loads the gtfs tables very fast, and my API is working in the cloud.

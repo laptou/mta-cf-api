@@ -219,7 +219,7 @@ fn process_stop_times_rows(
 
     let sql = storage.sql();
 
-    storage.transaction(&mut || {
+    storage.transaction_sync(&mut || {
         let query = "
         INSERT OR REPLACE INTO stop_times
         (trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds, 
@@ -412,7 +412,7 @@ extern "C" {
     pub fn sql(this: &DurableObjectStorage) -> DurableObjectSqlStorage;
 
     #[wasm_bindgen(method)]
-    pub fn transaction(this: &DurableObjectStorage, cb: &mut dyn FnMut() -> Result<(), JsValue>);
+    pub fn transaction_sync(this: &DurableObjectStorage, cb: &mut dyn FnMut() -> Result<(), JsValue>);
 
     pub type DurableObjectSqlStorage;
 
