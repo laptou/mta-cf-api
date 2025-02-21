@@ -159,10 +159,10 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	async loadGtfsStatic() {
-		// if (!(await this.shouldUpdateGtfs())) {
-		// 	console.log("not updating static gtfs");
-		// 	return;
-		// }
+		if (!(await this.shouldUpdateGtfs())) {
+			console.log("not updating static gtfs");
+			return;
+		}
 
 		console.log("updating static gtfs");
 
@@ -393,7 +393,7 @@ export class MtaStateObject extends DurableObject {
 						JOIN trips t ON t.trip_id = st.trip_id
 						JOIN stops s ON s.stop_id = st.stop_id
 						WHERE (s.stop_id = $1 or s.parent_station = $1) AND t.route_id = $2 AND st.arrival_total_seconds >= $4
-						ORDER BY st.arrival_total_seconds,
+						ORDER BY st.arrival_total_seconds
 						LIMIT $3`,
 						stationId,
 						lineId,
