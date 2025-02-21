@@ -22,3 +22,5 @@ Error: To execute a transaction, please use the state.storage.transaction() or s
 
 - holy shit. transactions was the unlock i needed. insert + response time went down to 4211ms. that's with no index, let's try adding one. 
 - it's still insanely fast. just recorded 3910ms.
+
+- IT WORKS IN THE CLOUD!!

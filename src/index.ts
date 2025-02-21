@@ -173,10 +173,10 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	async loadGtfsStatic() {
-		// if (!(await this.shouldUpdateGtfs())) {
-		// 	console.log("not updating static gtfs");
-		// 	return;
-		// }
+		if (!(await this.shouldUpdateGtfs())) {
+			console.log("not updating static gtfs");
+			return;
+		}
 
 		console.log("updating static gtfs");
 
