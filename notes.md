@@ -19,3 +19,6 @@ Error: To execute a transaction, please use the state.storage.transaction() or s
     at unpack_csv_archive (file:///home/ibiyemi/projects/scratch/mta-cf-api/.wrangler/tmp/dev-68zz23/index.js:5495:20)
     at MtaStateObject.loadGtfsStatic (file:///home/ibiyemi/projects/scratch/mta-cf-api/.wrangler/tmp/dev-68zz23/index.js:5754:7)
 ```
+
+- holy shit. transactions was the unlock i needed. insert + response time went down to 4211ms. that's with no index, let's try adding one. 
+- it's still insanely fast. just recorded 3910ms.

@@ -117,6 +117,7 @@ export class MtaStateObject extends DurableObject {
         shape_id TEXT
       );
 
+			CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times(stop_id);
       CREATE INDEX IF NOT EXISTS idx_trips_route_id ON trips(route_id);
       CREATE INDEX IF NOT EXISTS idx_stops_parent_station ON stops(parent_station);
 
