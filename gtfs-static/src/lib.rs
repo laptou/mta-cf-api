@@ -5,7 +5,7 @@ mod utils;
 use anyhow::{anyhow, Context};
 use csv::StringRecord;
 use itertools::Itertools;
-use js_sys::{Array, Function, JsString, Reflect, Uint8Array};
+use js_sys::{Array, Function, JsString, Object, Reflect, Uint8Array};
 use serde::Deserialize;
 use std::{io::Cursor, str};
 use wasm_bindgen::prelude::*;
@@ -105,16 +105,16 @@ fn log(s: &str) {
 fn process_calendar_rows(
     headers: &StringRecord,
     chunk: &[StringRecord],
-    sql_exec: &Function,
+    storage: &DurableObjectStorage,
 ) -> anyhow::Result<()> {
-    log(&format!("Processing {} calendar rows", chunk.len()));
+    log(&format!("processing {} calendar rows", chunk.len()));
 
-    let query = JsValue::from_str(
-        "
+    let sql = storage.sql();
+
+    let query = "
 INSERT OR REPLACE INTO calendar 
 (service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    );
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     for record in chunk {
         let row: CalendarRow = record
@@ -124,7 +124,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         // Build the query and parameters.
 
         let params = Array::new();
-        params.push(&query);
         params.push(&JsValue::from_str(&row.service_id));
         params.push(&JsValue::from_f64(row.monday as f64));
         params.push(&JsValue::from_f64(row.tuesday as f64));
@@ -136,9 +135,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params.push(&JsValue::from_str(&row.start_date));
         params.push(&JsValue::from_str(&row.end_date));
 
-        sql_exec
-            .apply(&JsValue::NULL, &params)
-            .map_err(|err| anyhow!("sql_exec for calendar: {err:?}"))?;
+        sql.exec(query, &params)
+            .map_err(|err| anyhow!("sql_exec for calendar: {err:?}"))?
     }
 
     Ok(())
@@ -147,14 +145,14 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 fn process_calendar_dates_rows(
     headers: &StringRecord,
     chunk: &[StringRecord],
-    sql_exec: &Function,
+    storage: &DurableObjectStorage,
 ) -> anyhow::Result<()> {
-    log(&format!("Processing {} calendar_dates rows", chunk.len()));
-    let query = JsValue::from_str(
-        "
+    log(&format!("processing {} calendar_dates rows", chunk.len()));
+
+    let sql = storage.sql();
+    let query = "
 INSERT OR REPLACE INTO calendar_dates 
-(service_id, date, exception_type) VALUES (?, ?, ?)",
-    );
+(service_id, date, exception_type) VALUES (?, ?, ?)";
 
     for record in chunk {
         let row: CalendarDatesRow = record
@@ -162,32 +160,31 @@ INSERT OR REPLACE INTO calendar_dates
             .context("deserialize CalendarDatesRow")?;
 
         let params = Array::new();
-        params.push(&query);
         params.push(&JsValue::from_str(&row.service_id));
         params.push(&JsValue::from_str(&row.date));
         params.push(&JsValue::from_f64(row.exception_type as f64));
 
-        sql_exec
-            .apply(&JsValue::NULL, &params)
+        sql.exec(query, &params)
             .map_err(|err| anyhow!("sql_exec for calendar_dates: {err:?}"))?;
     }
+
     Ok(())
 }
 
 fn process_routes_rows(
     headers: &StringRecord,
     chunk: &[StringRecord],
-    sql_exec: &Function,
+    storage: &DurableObjectStorage,
 ) -> anyhow::Result<()> {
-    log(&format!("Processing {} routes rows", chunk.len()));
+    log(&format!("processing {} routes rows", chunk.len()));
 
-    let query = JsValue::from_str(
-        "
+    let sql = storage.sql();
+
+    let query = "
 INSERT OR REPLACE INTO routes 
 (route_id, agency_id, route_short_name, route_long_name, route_type, 
 route_desc, route_url, route_color, route_text_color)
- VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    );
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     for record in chunk {
         let row: RoutesRow = record
@@ -195,7 +192,6 @@ route_desc, route_url, route_color, route_text_color)
             .context("deserialize RoutesRow")?;
 
         let params = Array::new();
-        params.push(&query);
         params.push(&JsValue::from_str(&row.route_id));
         params.push(&JsValue::from_str(&row.agency_id));
         params.push(&JsValue::from_str(&row.route_short_name));
@@ -208,8 +204,7 @@ route_desc, route_url, route_color, route_text_color)
             row.route_text_color.as_deref().unwrap_or(""),
         ));
 
-        sql_exec
-            .apply(&JsValue::NULL, &params)
+        sql.exec(query, &params)
             .map_err(|err| anyhow!("sql_exec for routes: {err:?}"))?;
     }
     Ok(())
@@ -218,70 +213,96 @@ route_desc, route_url, route_color, route_text_color)
 fn process_stop_times_rows(
     headers: &StringRecord,
     chunk: &[StringRecord],
-    sql_exec: &Function,
+    storage: &DurableObjectStorage,
 ) -> anyhow::Result<()> {
-    log(&format!("Processing {} stop_times rows", chunk.len()));
+    log(&format!("processing {} stop_times rows", chunk.len()));
 
-    let query = JsValue::from_str(
-        "
-    INSERT OR REPLACE INTO stop_times
-    (trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds, 
-    departure_hours, departure_minutes, departure_seconds, stop_sequence) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    );
+    let sql = storage.sql();
 
-    let params = Array::new_with_length(10);
-    params.set(0, query);
+    storage.transaction(&mut || {
+        let query = "
+        INSERT OR REPLACE INTO stop_times
+        (trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds, 
+        departure_hours, departure_minutes, departure_seconds, stop_sequence) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-    let trip_id_idx = headers.iter().position(|h| h == "trip_id").unwrap();
-    let stop_id_idx = headers.iter().position(|h| h == "stop_id").unwrap();
-    let arrival_time_idx = headers.iter().position(|h| h == "arrival_time").unwrap();
-    let departure_time_idx = headers.iter().position(|h| h == "departure_time").unwrap();
-    let stop_sequence_idx = headers.iter().position(|h| h == "stop_sequence").unwrap();
+        let query = &std::iter::repeat_n(query, 1).join(";");
 
-    for record in chunk {
-        let row = record.iter().collect_vec();
+        let params = Array::new_with_length(9);
 
-        let trip_id = row[trip_id_idx];
-        let stop_id = row[stop_id_idx];
-        let arrival_time = row[arrival_time_idx];
-        let departure_time = row[departure_time_idx];
-        let stop_sequence = u32::from_str_radix(row[stop_sequence_idx], 10).unwrap();
-        
-        let (a_h, a_m, a_s) = parse_gtfs_time(arrival_time).context("parse arrival_time")?;
-        let (d_h, d_m, d_s) =
-            parse_gtfs_time(departure_time).context("parse departure_time")?;
+        let trip_id_idx = headers.iter().position(|h| h == "trip_id").unwrap();
+        let stop_id_idx = headers.iter().position(|h| h == "stop_id").unwrap();
+        let arrival_time_idx = headers.iter().position(|h| h == "arrival_time").unwrap();
+        let departure_time_idx = headers.iter().position(|h| h == "departure_time").unwrap();
+        let stop_sequence_idx = headers.iter().position(|h| h == "stop_sequence").unwrap();
 
-        params.set(1, JsValue::from_str(&trip_id));
-        params.set(2, JsValue::from_str(&stop_id));
-        params.set(3, JsValue::from_f64(a_h as f64));
-        params.set(4, JsValue::from_f64(a_m as f64));
-        params.set(5, JsValue::from_f64(a_s as f64));
-        params.set(6, JsValue::from_f64(d_h as f64));
-        params.set(7, JsValue::from_f64(d_m as f64));
-        params.set(8, JsValue::from_f64(d_s as f64));
-        params.set(9, JsValue::from_f64(stop_sequence as f64));
+        for record in chunk {
+            let row = record.iter().collect_vec();
 
-        sql_exec
-            .apply(&JsValue::NULL, &params)
-            .map_err(|err| anyhow!("sql_exec for stop_times: {err:?}"))?;
-    }
+            let trip_id = row[trip_id_idx];
+            let stop_id = row[stop_id_idx];
+            let arrival_time = row[arrival_time_idx];
+            let departure_time = row[departure_time_idx];
+            let stop_sequence = u32::from_str_radix(row[stop_sequence_idx], 10).unwrap();
+
+            let (a_h, a_m, a_s) = parse_gtfs_time(arrival_time)
+                .context("parse arrival_time")
+                .map_err(|err| JsValue::from_str(&format!("{err:?}")))?;
+            let (d_h, d_m, d_s) = parse_gtfs_time(departure_time)
+                .context("parse departure_time")
+                .map_err(|err| JsValue::from_str(&format!("{err:?}")))?;
+
+            params.set(0, JsValue::from_str(&trip_id));
+            params.set(1, JsValue::from_str(&stop_id));
+            params.set(2, JsValue::from_f64(a_h as f64));
+            params.set(3, JsValue::from_f64(a_m as f64));
+            params.set(4, JsValue::from_f64(a_s as f64));
+            params.set(5, JsValue::from_f64(d_h as f64));
+            params.set(6, JsValue::from_f64(d_m as f64));
+            params.set(7, JsValue::from_f64(d_s as f64));
+            params.set(8, JsValue::from_f64(stop_sequence as f64));
+
+            sql.exec(query, &params)?;
+        }
+
+        Ok(())
+    });
+
+    // // having an index enabled while inserting 2.2 million rows is too slow
+    // sql_exec
+    //     .apply(
+    //         &JsValue::NULL,
+    //         &Array::from_iter([JsValue::from_str(
+    //             "DROP INDEX IF EXISTS idx_stop_times_stop_id",
+    //         )]),
+    //     )
+    //     .map_err(|err| anyhow!("sql_exec for stop_times drop index: {err:?}"))?;
+
+    // sql_exec
+    //     .apply(
+    //         &JsValue::NULL,
+    //         &Array::from_iter([JsValue::from_str(
+    //             "CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times(stop_id)",
+    //         )]),
+    //     )
+    //     .map_err(|err| anyhow!("sql_exec for stop_times create index: {err:?}"))?;
+
     Ok(())
 }
 
 fn process_stops_rows(
     headers: &StringRecord,
     chunk: &[StringRecord],
-    sql_exec: &Function,
+    storage: &DurableObjectStorage,
 ) -> anyhow::Result<()> {
     log(&format!("Processing {} stops rows", chunk.len()));
+    let sql = storage.sql();
 
-    let query = JsValue::from_str(
+    let query = 
         "
 INSERT OR REPLACE INTO stops
 (stop_id, stop_name, stop_lat, stop_lon, location_type, parent_station)
-VALUES (?, ?, ?, ?, ?, ?)",
-    );
+VALUES (?, ?, ?, ?, ?, ?)";
 
     for record in chunk {
         let row: StopsRow = record
@@ -289,7 +310,7 @@ VALUES (?, ?, ?, ?, ?, ?)",
             .context("deserialize StopsRow")?;
 
         let params = Array::new();
-        params.push(&query);
+        
         params.push(&JsValue::from_str(&row.stop_id));
         params.push(&JsValue::from_str(&row.stop_name));
         params.push(&JsValue::from_f64(row.stop_lat));
@@ -303,8 +324,7 @@ VALUES (?, ?, ?, ?, ?, ?)",
             row.parent_station.as_deref().unwrap_or(""),
         ));
 
-        sql_exec
-            .apply(&JsValue::NULL, &params)
+        sql.exec(query, &params)
             .map_err(|err| anyhow!("sql_exec for stops: {err:?}"))?;
     }
     Ok(())
@@ -313,16 +333,16 @@ VALUES (?, ?, ?, ?, ?, ?)",
 fn process_transfers_rows(
     headers: &StringRecord,
     chunk: &[StringRecord],
-    sql_exec: &Function,
+    storage: &DurableObjectStorage,
 ) -> anyhow::Result<()> {
     log(&format!("Processing {} transfers rows", chunk.len()));
 
-    let query = JsValue::from_str(
-        "\
+    let sql = storage.sql();
+
+    let query = "\
 INSERT OR REPLACE INTO transfers \
 (from_stop_id, to_stop_id, transfer_type, min_transfer_time) \
-VALUES (?, ?, ?, ?)",
-    );
+VALUES (?, ?, ?, ?)";
 
     for record in chunk {
         let row: TransfersRow = record
@@ -330,7 +350,7 @@ VALUES (?, ?, ?, ?)",
             .context("deserialize TransfersRow")?;
 
         let params = Array::new();
-        params.push(&query);
+        
         params.push(&JsValue::from_str(&row.from_stop_id));
         params.push(&JsValue::from_str(&row.to_stop_id));
         params.push(&JsValue::from_f64(row.transfer_type as f64));
@@ -341,8 +361,7 @@ VALUES (?, ?, ?, ?)",
             None => params.push(&JsValue::NULL),
         };
 
-        sql_exec
-            .apply(&JsValue::NULL, &params)
+        sql.exec(query, &params)
             .map_err(|err| anyhow!("sql_exec for transfers: {err:?}"))?;
     }
     Ok(())
@@ -351,16 +370,17 @@ VALUES (?, ?, ?, ?)",
 fn process_trips_rows(
     headers: &StringRecord,
     chunk: &[StringRecord],
-    sql_exec: &Function,
+    storage: &DurableObjectStorage,
 ) -> anyhow::Result<()> {
-    log(&format!("Processing {} trips rows", chunk.len()));
+    log(&format!("processing {} trips rows", chunk.len()));
 
-    let query = JsValue::from_str(
+    let sql = storage.sql();
+
+    let query =
         "\
 INSERT OR REPLACE INTO trips \
 (route_id, trip_id, service_id, trip_headsign, direction_id, shape_id) \
-VALUES (?, ?, ?, ?, ?, ?)",
-    );
+VALUES (?, ?, ?, ?, ?, ?)";
 
     for record in chunk {
         let row: TripsRow = record
@@ -368,7 +388,7 @@ VALUES (?, ?, ?, ?, ?, ?)",
             .context("deserialize TripsRow")?;
 
         let params = Array::new();
-        params.push(&query);
+        
         params.push(&JsValue::from_str(&row.route_id));
         params.push(&JsValue::from_str(&row.trip_id));
         params.push(&JsValue::from_str(&row.service_id));
@@ -376,8 +396,7 @@ VALUES (?, ?, ?, ?, ?, ?)",
         params.push(&JsValue::from_str(&row.direction_id));
         params.push(&JsValue::from_str(&row.shape_id));
 
-        sql_exec
-            .apply(&JsValue::NULL, &params)
+        sql.exec(query, &params)
             .map_err(|err| anyhow!("sql_exec for trips: {err:?}"))?;
     }
     Ok(())
@@ -386,24 +405,39 @@ VALUES (?, ?, ?, ?, ?, ?)",
 // --- Main entry point ---
 
 #[wasm_bindgen]
-pub fn unpack_csv_archive(
-    data: Uint8Array,
-    row_chunk_len: usize,
-    sql_exec: Function,
-) -> Result<(), JsValue> {
-    let mut buf = Vec::with_capacity(data.byte_length() as usize);
-    data.copy_to_uninit(buf.spare_capacity_mut());
-    // SAFETY: set_len after copy.
-    unsafe { buf.set_len(data.byte_length() as usize) };
+extern "C" {
+    pub type DurableObjectStorage;
 
-    unpack_csv_archive_inner(&buf, row_chunk_len, &sql_exec)
+    #[wasm_bindgen(method, getter)]
+    pub fn sql(this: &DurableObjectStorage) -> DurableObjectSqlStorage;
+
+    #[wasm_bindgen(method)]
+    pub fn transaction(this: &DurableObjectStorage, cb: &mut dyn FnMut() -> Result<(), JsValue>);
+
+    pub type DurableObjectSqlStorage;
+
+    #[wasm_bindgen(method, catch, variadic)]
+    pub fn exec(
+        this: &DurableObjectSqlStorage,
+        query: &str,
+        bindings: &Array,
+    ) -> Result<(), JsValue>;
+}
+
+#[wasm_bindgen]
+pub fn unpack_csv_archive(
+    buf: Box<[u8]>,
+    row_chunk_len: usize,
+    storage: DurableObjectStorage,
+) -> Result<(), JsValue> {
+    unpack_csv_archive_inner(&buf, row_chunk_len, &storage)
         .map_err(|err| JsValue::from_str(&format!("{err:?}")))
 }
 
 fn unpack_csv_archive_inner(
     buf: &[u8],
     row_chunk_len: usize,
-    sql_exec: &Function,
+    storage: &DurableObjectStorage,
 ) -> anyhow::Result<()> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(buf)).context("could not create zip archive")?;
@@ -418,7 +452,7 @@ fn unpack_csv_archive_inner(
             println!("skipping shapes.txt");
         }
 
-        log(&format!("Extracting file {}", file_name));
+        log(&format!("extracting file {}", file_name));
 
         let mut rdr = csv::ReaderBuilder::new()
             .flexible(true)
@@ -427,7 +461,7 @@ fn unpack_csv_archive_inner(
         let headers = rdr.headers()?.clone();
 
         log(&format!(
-            "Headers for {}: {}",
+            "headers for {}: {}",
             file_name,
             headers.iter().join(", ")
         ));
@@ -441,10 +475,10 @@ fn unpack_csv_archive_inner(
             total += 1;
 
             if chunk.len() >= row_chunk_len {
-                process_chunk(&file_name, &headers, &chunk, sql_exec)?;
+                process_chunk(&file_name, &headers, &chunk, storage)?;
 
                 log(&format!(
-                    "Processed {} rows ({total} total) from {}",
+                    "processed {} rows ({total} total) from {}",
                     chunk.len(),
                     file_name
                 ));
@@ -454,10 +488,10 @@ fn unpack_csv_archive_inner(
         }
 
         if !chunk.is_empty() {
-            process_chunk(&file_name, &headers, &chunk, sql_exec)?;
+            process_chunk(&file_name, &headers, &chunk, storage)?;
 
             log(&format!(
-                "Processed {} rows ({total} total) from {} (final chunk)",
+                "processed {} rows ({total} total) from {} (final chunk)",
                 chunk.len(),
                 file_name
             ));
@@ -471,16 +505,16 @@ fn process_chunk(
     file_name: &str,
     headers: &StringRecord,
     chunk: &[StringRecord],
-    sql_exec: &Function,
+    storage: &DurableObjectStorage,
 ) -> anyhow::Result<()> {
     match file_name {
-        "calendar.txt" => process_calendar_rows(headers, chunk, sql_exec),
-        "calendar_dates.txt" => process_calendar_dates_rows(headers, chunk, sql_exec),
-        "routes.txt" => process_routes_rows(headers, chunk, sql_exec),
-        "stop_times.txt" => process_stop_times_rows(headers, chunk, sql_exec),
-        "stops.txt" => process_stops_rows(headers, chunk, sql_exec),
-        "transfers.txt" => process_transfers_rows(headers, chunk, sql_exec),
-        "trips.txt" => process_trips_rows(headers, chunk, sql_exec),
+        "calendar.txt" => process_calendar_rows(headers, chunk, storage),
+        "calendar_dates.txt" => process_calendar_dates_rows(headers, chunk, storage),
+        "routes.txt" => process_routes_rows(headers, chunk, storage),
+        "stop_times.txt" => process_stop_times_rows(headers, chunk, storage),
+        "stops.txt" => process_stops_rows(headers, chunk, storage),
+        "transfers.txt" => process_transfers_rows(headers, chunk, storage),
+        "trips.txt" => process_trips_rows(headers, chunk, storage),
         other => {
             log(&format!("Skipping unknown file: {}", other));
             Ok(())

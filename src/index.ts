@@ -117,7 +117,6 @@ export class MtaStateObject extends DurableObject {
         shape_id TEXT
       );
 
-      CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times(stop_id);
       CREATE INDEX IF NOT EXISTS idx_trips_route_id ON trips(route_id);
       CREATE INDEX IF NOT EXISTS idx_stops_parent_station ON stops(parent_station);
 
@@ -184,7 +183,11 @@ export class MtaStateObject extends DurableObject {
 			const gtfsResponse = await fetch(MTA_SUPPLEMENTED_GTFS_STATIC_URL);
 			const buf = await gtfsResponse.bytes();
 
-			unpack_csv_archive(buf, 50_000, this.sql.exec.bind(this.sql));
+			unpack_csv_archive(
+				buf,
+				50_000,
+				this.ctx.storage,
+			);
 
 			console.log("gtfs static timetable update completed");
 
