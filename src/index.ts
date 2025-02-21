@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { Temporal } from "temporal-polyfill";
 import { unpackCsvArchive } from "../gtfs-importer/binding";
+import { FeedMessage } from "./proto/gtfs-realtime";
 
 function parseGtfsDate(date: string): Temporal.PlainDate {
 	const year = Number.parseInt(date.slice(0, 4), 10);
@@ -65,15 +66,10 @@ export class MtaStateObject extends DurableObject {
       CREATE TABLE IF NOT EXISTS stop_times (
         trip_id TEXT,
         stop_id TEXT,
-        arrival_hours INTEGER,
-        arrival_minutes INTEGER,
-        arrival_seconds INTEGER,
 				arrival_total_seconds INTEGER,
-        departure_hours INTEGER,
-        departure_minutes INTEGER,
-        departure_seconds INTEGER,
 				departure_total_seconds INTEGER,
         stop_sequence INTEGER,
+				is_realtime_updated INTEGER DEFAULT 0,
         PRIMARY KEY (trip_id, stop_id)
       );
 
@@ -120,17 +116,30 @@ export class MtaStateObject extends DurableObject {
 
 		let response: Response;
 		switch (url.pathname) {
-			case "/lines":
-				response = await this.handleGetAllLines();
+			case "/routes":
+				response = await this.handleGetAllRoutes();
 				break;
 			case "/stations":
-				response = await this.handleGetStationsForLine(url.searchParams);
+				response = await this.handleGetStationsForRoute(url.searchParams);
 				break;
 			case "/station":
 				response = await this.handleGetStation(url.searchParams);
 				break;
 			case "/arrivals":
 				response = await this.handleGetUpcomingArrivals(url.searchParams);
+				break;
+			case "/rt":
+				response = new Response(
+					JSON.stringify(
+						await this.getRealtimeStatus(),
+						(key, value) =>
+							typeof value === "bigint" ? value.toString() : value, // return everything else unchanged
+					),
+				);
+				break;
+			case "/rt-update":
+				await this.updateRealtimeStatus();
+				response = new Response("done");
 				break;
 			default:
 				response = new Response("not found", { status: 404 });
@@ -188,9 +197,9 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	/**
-	 * Returns all lines (routes).
+	 * Returns all routes.
 	 */
-	async handleGetAllLines(): Promise<Response> {
+	async handleGetAllRoutes(): Promise<Response> {
 		try {
 			// Use a generic type in case you need type hints.
 			type RouteRow = {
@@ -228,13 +237,13 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	/**
-	 * Returns stations for a given line id.
+	 * Returns stations for a given route id.
 	 * Uses the trips table to find trips for the route and then all distinct stops.
 	 */
-	async handleGetStationsForLine(params: URLSearchParams): Promise<Response> {
-		const lineId = params.get("lineId");
-		if (!lineId) {
-			return new Response("missing lineId parameter", { status: 400 });
+	async handleGetStationsForRoute(params: URLSearchParams): Promise<Response> {
+		const routeId = params.get("routeId");
+		if (!routeId) {
+			return new Response("missing routeId parameter", { status: 400 });
 		}
 
 		try {
@@ -257,8 +266,8 @@ export class MtaStateObject extends DurableObject {
 						AND s2.parent_station IS NOT NULL
 				)
 				`,
-				lineId,
-				lineId,
+				routeId,
+				routeId,
 			);
 
 			const stopsResult = stopsCursor.toArray();
@@ -339,7 +348,7 @@ export class MtaStateObject extends DurableObject {
 	 */
 	async handleGetUpcomingArrivals(params: URLSearchParams): Promise<Response> {
 		const stationId = params.get("stationId");
-		const lineId = params.get("lineId");
+		const routeId = params.get("routeId");
 
 		if (!stationId) {
 			return new Response("missing stationId parameter", { status: 400 });
@@ -365,15 +374,12 @@ export class MtaStateObject extends DurableObject {
 			// Use the provided stationId as the stop_id.
 			// Get all upcoming stop_times for that stop joined with trips.
 			type ArrivalRow = {
+				is_realtime_updated: 0 | 1;
 				trip_id: string;
 				stop_id: string;
 				stop_name: string;
-				arrival_hours: number;
-				arrival_minutes: number;
-				arrival_seconds: number;
-				departure_hours: number;
-				departure_minutes: number;
-				departure_seconds: number;
+				arrival_total_seconds: number;
+				departure_total_seconds: number;
 				stop_sequence: number;
 				route_id: string;
 				service_id: string;
@@ -386,7 +392,7 @@ export class MtaStateObject extends DurableObject {
 			const activeServiceIds = await this.getActiveServiceIds();
 			// console.log({ activeServiceIds });
 
-			const arrivalCursor = lineId
+			const arrivalCursor = routeId
 				? this.sql.exec<ArrivalRow>(
 						`SELECT st.*, t.route_id, t.service_id, s.stop_name
 						FROM stop_times st
@@ -399,7 +405,7 @@ export class MtaStateObject extends DurableObject {
 						ORDER BY st.arrival_total_seconds
 						LIMIT $4`,
 						stationId,
-						lineId,
+						routeId,
 						nowTotalSeconds,
 						// double the limit to account for services that aren't active today
 						limit * 2,
@@ -422,24 +428,25 @@ export class MtaStateObject extends DurableObject {
 
 			const rows = arrivalCursor.toArray();
 			const upcoming: {
-				line: string;
+				route: string;
 				tripId: string;
 				stopId: string;
 				stopName: string;
 				arrivalTime: Temporal.PlainTime;
 				departureTime: Temporal.PlainTime;
+				isRealtimeUpdated: boolean;
 				stopSequence: number;
 			}[] = [];
+
+			const zeroTime = Temporal.PlainTime.from("00:00:00");
 
 			// For each stop_time row, check if:
 			// • the arrival time is later than now, and
 			// • the service is active today.
 			for (const row of rows) {
 				console.log(row);
-				const arrivalTime = Temporal.PlainTime.from({
-					hour: row.arrival_hours,
-					minute: row.arrival_minutes,
-					second: row.arrival_seconds,
+				const arrivalTime = zeroTime.add({
+					seconds: row.arrival_total_seconds,
 				});
 
 				// Check if the service for this row is active today.
@@ -449,19 +456,18 @@ export class MtaStateObject extends DurableObject {
 					continue;
 				}
 
-				const departureTime = Temporal.PlainTime.from({
-					hour: row.departure_hours,
-					minute: row.departure_minutes,
-					second: row.departure_seconds,
+				const departureTime = zeroTime.add({
+					seconds: row.departure_total_seconds,
 				});
 
 				upcoming.push({
-					line: row.route_id,
+					route: row.route_id,
 					tripId: row.trip_id,
 					stopId: row.stop_id,
 					stopName: row.stop_name,
 					arrivalTime,
 					departureTime,
+					isRealtimeUpdated: row.is_realtime_updated > 0,
 					stopSequence: row.stop_sequence,
 				});
 
@@ -597,6 +603,99 @@ export class MtaStateObject extends DurableObject {
 			default:
 				return false;
 		}
+	}
+
+	async getRealtimeStatus(): Promise<FeedMessage> {
+		const endpoint =
+			"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace";
+
+		const response = await fetch(new Request(endpoint));
+		return FeedMessage.fromBinary(await response.bytes());
+	}
+
+	async updateRealtimeStatus() {
+		const status = await this.getRealtimeStatus();
+		const activeServices = await this.getActiveServiceIds();
+
+		await this.ctx.storage.transaction(async () => {
+			for (const msg of status.entity) {
+				if (msg.tripUpdate) {
+					if (!msg.tripUpdate.trip) {
+						console.warn("got trip update without trip", msg);
+						continue;
+					}
+
+					// MTA identifies trips in realtime feed with a trip ID suffix, like
+					// "082500_A..N54R". update the trips with active service
+					const tripIdSuffix = msg.tripUpdate.trip.tripId;
+
+					const tripIds = this.sql
+						.exec<{ trip_id: string; service_id: string }>(
+							"SELECT trip_id, service_id FROM trips WHERE trip_id LIKE $1",
+							`%${tripIdSuffix}`,
+						)
+						.toArray()
+						.filter((r) => activeServices.includes(r.service_id))
+						.map((r) => r.trip_id);
+
+					const zeroTime = Temporal.PlainTime.from("00:00:00");
+
+					// biome-ignore lint/style/noNonNullAssertion: we already checked it
+					for (const stopTimeUpdate of msg.tripUpdate!.stopTimeUpdate) {
+						if (!stopTimeUpdate.stopId) continue;
+
+						const newArrival = stopTimeUpdate.arrival?.time
+							? Temporal.Instant.fromEpochSeconds(
+									Number(stopTimeUpdate.arrival.time),
+								)
+									.toZonedDateTime({
+										timeZone: "America/New_York",
+										calendar: "gregory",
+									})
+									.toPlainTime()
+									.since(zeroTime)
+									.total("seconds") | 0
+							: null;
+
+						const newDeparture = stopTimeUpdate.departure?.time
+							? Temporal.Instant.fromEpochSeconds(
+									Number(stopTimeUpdate.departure.time),
+								)
+									.toZonedDateTime({
+										timeZone: "America/New_York",
+										calendar: "gregory",
+									})
+									.toPlainTime()
+									.since(zeroTime)
+									.total("seconds") | 0
+							: null;
+
+						console.log(
+							"processing stop time update for trip",
+							tripIdSuffix,
+							stopTimeUpdate.stopId,
+							newArrival,
+							newDeparture,
+						);
+
+						const result = this.sql.exec(
+							`
+							UPDATE stop_times 
+							SET arrival_total_seconds = NULLIF($1, arrival_total_seconds), 
+								departure_total_seconds = NULLIF($2, departure_total_seconds), 
+								is_realtime_updated = 1
+							WHERE trip_id IN (${tripIds.map((t) => `"${t}"`).join(",")}) AND stop_id == $4
+						`,
+							newArrival,
+							newDeparture,
+							stopTimeUpdate.stopId,
+						);
+
+						console.log("rows written", result.rowsWritten);
+					}
+				}
+			}
+		});
 	}
 }
 

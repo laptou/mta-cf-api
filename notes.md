@@ -46,3 +46,8 @@ now it loads the gtfs tables very fast, and my API is working in the cloud.
 
 - discovered a bug? where putting placeholders out of order will not work as
   expected
+
+- i just noticed that transaction() returns a promise. so the reason using it is
+  so fast is probably because it is able to pipeline the writes instead of doing
+  them serially. this method of handlign things doesn't seem to allow me to
+  notice if the transaction fails, though :/

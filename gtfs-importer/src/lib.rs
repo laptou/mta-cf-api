@@ -9,6 +9,7 @@ use js_sys::{Array, Function, JsString, Object, Promise, Reflect, Uint8Array};
 use serde::Deserialize;
 use std::{io::Cursor, str};
 use wasm_bindgen::prelude::*;
+use web_sys::console;
 
 // --- Structures for each file type ---
 
@@ -219,75 +220,53 @@ fn process_stop_times_rows(
 
     let sql = storage.sql();
 
-    storage.transaction(&mut || {
-        let query = "
-        INSERT OR REPLACE INTO stop_times
-        (trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds, arrival_total_seconds,
-        departure_hours, departure_minutes, departure_seconds, departure_total_seconds, stop_sequence) 
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
+    let _ = storage
+        .transaction(&mut || {
+            let query = "
+                INSERT OR REPLACE INTO stop_times
+                (trip_id, stop_id, arrival_total_seconds, departure_total_seconds, stop_sequence, is_realtime_updated) 
+                VALUES ($1, $2, $3, $4, $5, 0)";
 
-        let query = &std::iter::repeat_n(query, 1).join(";");
+            let params = Array::new_with_length(5);
 
-        let params = Array::new_with_length(11);
+            let trip_id_idx = headers.iter().position(|h| h == "trip_id").unwrap();
+            let stop_id_idx = headers.iter().position(|h| h == "stop_id").unwrap();
+            let arrival_time_idx = headers.iter().position(|h| h == "arrival_time").unwrap();
+            let departure_time_idx = headers.iter().position(|h| h == "departure_time").unwrap();
+            let stop_sequence_idx = headers.iter().position(|h| h == "stop_sequence").unwrap();
 
-        let trip_id_idx = headers.iter().position(|h| h == "trip_id").unwrap();
-        let stop_id_idx = headers.iter().position(|h| h == "stop_id").unwrap();
-        let arrival_time_idx = headers.iter().position(|h| h == "arrival_time").unwrap();
-        let departure_time_idx = headers.iter().position(|h| h == "departure_time").unwrap();
-        let stop_sequence_idx = headers.iter().position(|h| h == "stop_sequence").unwrap();
+            for record in chunk {
+                let row = record.iter().collect_vec();
 
-        for record in chunk {
-            let row = record.iter().collect_vec();
+                let trip_id = row[trip_id_idx];
+                let stop_id = row[stop_id_idx];
+                let arrival_time = row[arrival_time_idx];
+                let departure_time = row[departure_time_idx];
+                let stop_sequence = u32::from_str_radix(row[stop_sequence_idx], 10).unwrap();
 
-            let trip_id = row[trip_id_idx];
-            let stop_id = row[stop_id_idx];
-            let arrival_time = row[arrival_time_idx];
-            let departure_time = row[departure_time_idx];
-            let stop_sequence = u32::from_str_radix(row[stop_sequence_idx], 10).unwrap();
+                let (a_h, a_m, a_s) = parse_gtfs_time(arrival_time)
+                    .context("parse arrival_time")
+                    .map_err(|err| JsValue::from_str(&format!("{err:?}")))?;
+                let (d_h, d_m, d_s) = parse_gtfs_time(departure_time)
+                    .context("parse departure_time")
+                    .map_err(|err| JsValue::from_str(&format!("{err:?}")))?;
 
-            let (a_h, a_m, a_s) = parse_gtfs_time(arrival_time)
-                .context("parse arrival_time")
-                .map_err(|err| JsValue::from_str(&format!("{err:?}")))?;
-            let (d_h, d_m, d_s) = parse_gtfs_time(departure_time)
-                .context("parse departure_time")
-                .map_err(|err| JsValue::from_str(&format!("{err:?}")))?;
+                params.set(0, JsValue::from_str(&trip_id));
+                params.set(1, JsValue::from_str(&stop_id));
+                params.set(2, JsValue::from_f64((a_s + a_m * 60 + a_h * 3600) as f64));
+                params.set(3, JsValue::from_f64((d_s + d_m * 60 + d_h * 3600) as f64));
+                params.set(4, JsValue::from_f64(stop_sequence as f64));
 
-            params.set(0, JsValue::from_str(&trip_id));
-            params.set(1, JsValue::from_str(&stop_id));
-            params.set(2, JsValue::from_f64(a_h as f64));
-            params.set(3, JsValue::from_f64(a_m as f64));
-            params.set(4, JsValue::from_f64(a_s as f64));
-            params.set(5, JsValue::from_f64((a_s + a_m * 60 + a_h * 3600) as f64));
-            params.set(6, JsValue::from_f64(d_h as f64));
-            params.set(7, JsValue::from_f64(d_m as f64));
-            params.set(8, JsValue::from_f64(d_s as f64));
-            params.set(9, JsValue::from_f64((d_s + d_m * 60 + d_h * 3600) as f64));
-            params.set(10, JsValue::from_f64(stop_sequence as f64));
+                sql.exec(query, &params)
+                    .inspect_err(|err| console::error_1(err))?;
+            }
 
-            sql.exec(query, &params)?;
-        }
-
-        Ok(Promise::resolve(&JsValue::undefined()))
-    });
-
-    // // having an index enabled while inserting 2.2 million rows is too slow
-    // sql_exec
-    //     .apply(
-    //         &JsValue::NULL,
-    //         &Array::from_iter([JsValue::from_str(
-    //             "DROP INDEX IF EXISTS idx_stop_times_stop_id",
-    //         )]),
-    //     )
-    //     .map_err(|err| anyhow!("sql_exec for stop_times drop index: {err:?}"))?;
-
-    // sql_exec
-    //     .apply(
-    //         &JsValue::NULL,
-    //         &Array::from_iter([JsValue::from_str(
-    //             "CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times(stop_id)",
-    //         )]),
-    //     )
-    //     .map_err(|err| anyhow!("sql_exec for stop_times create index: {err:?}"))?;
+            Ok(Promise::resolve(&JsValue::undefined()))
+            // Ok(())
+        });
+    // .catch(&Closure::new(|err| {
+    //     console::error_1(&err);
+    // }));
 
     Ok(())
 }
@@ -411,11 +390,17 @@ extern "C" {
     #[wasm_bindgen(method, getter)]
     pub fn sql(this: &DurableObjectStorage) -> DurableObjectSqlStorage;
 
-    #[wasm_bindgen(method, js_name = "transaction")]
+    #[wasm_bindgen(method)]
     pub fn transaction(
         this: &DurableObjectStorage,
         cb: &mut dyn FnMut() -> Result<Promise, JsValue>,
-    );
+    ) -> Promise;
+
+    #[wasm_bindgen(method, catch, js_name = "transactionSync")]
+    pub fn transaction_sync(
+        this: &DurableObjectStorage,
+        cb: &mut dyn FnMut() -> Result<(), JsValue>,
+    ) -> Result<(), JsValue>;
 
     pub type DurableObjectSqlStorage;
 
