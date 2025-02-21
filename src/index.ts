@@ -116,6 +116,9 @@ export class MtaStateObject extends DurableObject {
 
 		let response: Response;
 		switch (url.pathname) {
+			case "/route":
+				response = await this.handleGetRoute(url.searchParams);
+				break;
 			case "/routes":
 				response = await this.handleGetAllRoutes();
 				break;
@@ -193,6 +196,54 @@ export class MtaStateObject extends DurableObject {
 		} catch (err) {
 			console.error(err);
 			throw err instanceof Error ? err : new Error(String(err));
+		}
+	}
+
+	async handleGetRoute(params: URLSearchParams): Promise<Response> {
+		const routeId = params.get("routeId");
+		if (!routeId) {
+			return new Response("missing routeId parameter", { status: 400 });
+		}
+
+		try {
+			// Use a generic type in case you need type hints.
+			type RouteRow = {
+				route_id: string;
+				agency_id: string;
+				route_short_name: string;
+				route_long_name: string;
+				route_type: number;
+				route_desc: string | null;
+				route_url: string | null;
+				route_color: string | null;
+				route_text_color: string | null;
+			};
+
+			const cursor = this.sql.exec<RouteRow>(
+				"SELECT * FROM routes WHERE route_id = $1",
+				routeId,
+			);
+
+			const route = cursor.one();
+
+			const camelCaseRoute = {
+				routeId: route.route_id,
+				agencyId: route.agency_id,
+				routeShortName: route.route_short_name,
+				routeLongName: route.route_long_name,
+				routeType: route.route_type,
+				routeDesc: route.route_desc,
+				routeUrl: route.route_url,
+				routeColor: route.route_color,
+				routeTextColor: route.route_text_color,
+			};
+
+			return new Response(JSON.stringify(camelCaseRoute), {
+				headers: { "Content-Type": "application/json" },
+			});
+		} catch (e) {
+			const error = e as Error;
+			return new Response(`Error: ${error.message}`, { status: 500 });
 		}
 	}
 
