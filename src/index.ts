@@ -2,9 +2,45 @@ import { DurableObject } from "cloudflare:workers";
 import { parse } from "csv-parse";
 import { Temporal } from "temporal-polyfill";
 import yauzl from "yauzl";
-import * as fflate from "fflate";
-import { Readable } from "node:stream";
-import { unpack_csv_archive } from "../gtfs-static/pkg/gtfs_static_patched";
+
+const zipFromBuffer = (buf: Buffer, opts: yauzl.Options) =>
+	new Promise<yauzl.ZipFile>((resolve, reject) =>
+		yauzl.fromBuffer(buf, opts, (err, archive) => {
+			if (err) reject(err);
+			else resolve(archive);
+		}),
+	);
+
+async function* processZipEntries(
+	zip: yauzl.ZipFile,
+): AsyncGenerator<[string, NodeJS.ReadableStream]> {
+	while (true) {
+		const entry: yauzl.Entry | null = await new Promise((resolve, reject) => {
+			zip.once("entry", resolve);
+			zip.once("end", () => resolve(null));
+			zip.once("error", reject);
+			zip.readEntry();
+		});
+
+		if (!entry) break;
+
+		// Skip shapes.txt if present
+		if (entry.fileName === "shapes.txt") {
+			continue;
+		}
+
+		const stream = await new Promise<NodeJS.ReadableStream>(
+			(resolve, reject) => {
+				zip.openReadStream(entry, (err, stream) => {
+					if (err) reject(err);
+					else resolve(stream);
+				});
+			},
+		);
+
+		yield [entry.fileName, stream];
+	}
+}
 
 // --- Helpers ---
 
@@ -173,24 +209,191 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	async loadGtfsStatic() {
-		if (!(await this.shouldUpdateGtfs())) {
-			console.log("not updating static gtfs");
-			return;
-		}
+		// if (!(await this.shouldUpdateGtfs())) {
+		// 	console.log("not updating static gtfs");
+		// 	return;
+		// }
 
 		console.log("updating static gtfs");
 
 		try {
 			const gtfsResponse = await fetch(MTA_SUPPLEMENTED_GTFS_STATIC_URL);
-			const buf = await gtfsResponse.bytes();
+			const buf = await gtfsResponse.arrayBuffer();
 
-			unpack_csv_archive(
-				buf,
-				50_000,
-				this.ctx.storage,
-			);
+			const gtfsArchive = await zipFromBuffer(Buffer.from(buf), {
+				lazyEntries: true,
+			});
+			const entries = processZipEntries(gtfsArchive);
 
-			console.log("gtfs static timetable update completed");
+			// unpack_csv_archive(
+			// 	buf,
+			// 	50_000,
+			// 	this.ctx.storage,
+			// );
+
+			for await (const [fileName, stream] of entries) {
+				const parser = parse({
+					columns: true,
+					skip_empty_lines: true,
+				});
+
+				stream.pipe(parser);
+
+				console.log(`processing ${fileName}`);
+
+				switch (fileName) {
+					case "calendar.txt":
+						for await (const entry of parser) {
+							this.sql.exec(
+								`INSERT OR REPLACE INTO calendar
+								(service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date)
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								entry.service_id,
+								Number.parseInt(entry.monday, 10),
+								Number.parseInt(entry.tuesday, 10),
+								Number.parseInt(entry.wednesday, 10),
+								Number.parseInt(entry.thursday, 10),
+								Number.parseInt(entry.friday, 10),
+								Number.parseInt(entry.saturday, 10),
+								Number.parseInt(entry.sunday, 10),
+								entry.start_date,
+								entry.end_date,
+							);
+						}
+						break;
+
+					case "calendar_dates.txt":
+						for await (const entry of parser) {
+							this.sql.exec(
+								`INSERT OR REPLACE INTO calendar_dates
+								(service_id, date, exception_type)
+								VALUES (?, ?, ?)`,
+								entry.service_id,
+								entry.date,
+								Number(entry.exception_type),
+							);
+						}
+						break;
+
+					case "routes.txt":
+						for await (const route of parser) {
+							this.sql.exec(
+								`INSERT OR REPLACE INTO routes
+								(route_id, agency_id, route_short_name, route_long_name, route_type,
+								route_desc, route_url, route_color, route_text_color)
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+								route.route_id,
+								route.agency_id,
+								route.route_short_name,
+								route.route_long_name,
+								Number(route.route_type),
+								route.route_desc || null,
+								route.route_url || null,
+								route.route_color || null,
+								route.route_text_color || null,
+							);
+						}
+						break;
+
+					case "stop_times.txt": {
+						let rows = [];
+						let iterator = parser.iterator();
+
+						while (true) {
+							let done = false;
+
+							for (let i = 0; i < 50_000; i++) {
+								let result = await iterator.next();
+								let value = result.value;
+								done = result.done ?? false;
+
+								if (done) break;
+
+								const [aH, aM, aS] = parseGtfsTime(value.arrival_time);
+								const [dH, dM, dS] = parseGtfsTime(value.departure_time);
+								rows.push([
+									value.trip_id,
+									value.stop_id,
+									aH,
+									aM,
+									aS,
+									dH,
+									dM,
+									dS,
+									Number(value.stop_sequence),
+								]);
+							}
+
+							this.ctx.storage.transactionSync(() => {
+								for (const row of rows)
+									this.ctx.storage.sql.exec(
+										`INSERT OR REPLACE INTO stop_times
+								(trip_id, stop_id, arrival_hours, arrival_minutes, arrival_seconds,
+								departure_hours, departure_minutes, departure_seconds, stop_sequence)
+								VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+										...row,
+									);
+
+								console.log(`inserted ${rows.length} rows`);
+							});
+
+							rows = [];
+
+							if (done) break;
+						}
+
+						break;
+					}
+
+					case "stops.txt":
+						for await (const stop of parser) {
+							this.sql.exec(
+								`INSERT OR REPLACE INTO stops
+								(stop_id, stop_name, stop_lat, stop_lon, location_type, parent_station)
+								VALUES (?, ?, ?, ?, ?, ?)`,
+								stop.stop_id,
+								stop.stop_name,
+								Number(stop.stop_lat),
+								Number(stop.stop_lon),
+								stop.location_type ? Number(stop.location_type) : null,
+								stop.parent_station || null,
+							);
+						}
+						break;
+
+					case "transfers.txt":
+						for await (const transfer of parser) {
+							this.sql.exec(
+								`INSERT OR REPLACE INTO transfers
+								(from_stop_id, to_stop_id, transfer_type, min_transfer_time)
+								VALUES (?, ?, ?, ?)`,
+								transfer.from_stop_id,
+								transfer.to_stop_id,
+								Number(transfer.transfer_type),
+								transfer.min_transfer_time
+									? Number(transfer.min_transfer_time)
+									: null,
+							);
+						}
+						break;
+
+					case "trips.txt":
+						for await (const trip of parser) {
+							this.sql.exec(
+								`INSERT OR REPLACE INTO trips
+								(route_id, trip_id, service_id, trip_headsign, direction_id, shape_id)
+								VALUES (?, ?, ?, ?, ?, ?)`,
+								trip.route_id,
+								trip.trip_id,
+								trip.service_id,
+								trip.trip_headsign,
+								trip.direction_id,
+								trip.shape_id,
+							);
+						}
+						break;
+				}
+			}
 
 			// Update the last update timestamp
 			const now = Temporal.Now.instant();
@@ -199,6 +402,8 @@ export class MtaStateObject extends DurableObject {
 				"last_gtfs_update",
 				now.toString(),
 			);
+
+			console.log("gtfs static timetable update completed");
 		} catch (err) {
 			console.error(err);
 			throw err instanceof Error ? err : new Error(String(err));
