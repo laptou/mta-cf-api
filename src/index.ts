@@ -379,10 +379,11 @@ export class MtaStateObject extends DurableObject {
 				service_id: string;
 			};
 
-			const now = Temporal.Now.plainTimeISO();
+			const now = Temporal.Now.plainTimeISO('America/New_York');
 			const nowTotalSeconds = now
 				.since(Temporal.PlainTime.from("00:00:00"))
 				.total("second") | 0;
+			// const nowTotalSeconds = 49_000;
 
 			console.log({ now, nowTotalSeconds });
 
@@ -392,27 +393,27 @@ export class MtaStateObject extends DurableObject {
 						FROM stop_times st
 						JOIN trips t ON t.trip_id = st.trip_id
 						JOIN stops s ON s.stop_id = st.stop_id
-						WHERE (s.stop_id = $1 or s.parent_station = $1) AND t.route_id = $2 AND st.arrival_total_seconds >= $4
+						WHERE (s.stop_id == $1 or s.parent_station == $1) AND (t.route_id == $2) AND (st.arrival_total_seconds >= $3)
 						ORDER BY st.arrival_total_seconds
-						LIMIT $3`,
+						LIMIT $4`,
 						stationId,
 						lineId,
+						nowTotalSeconds,
 						// double the limit to account for services that aren't active today
 						limit * 2,
-						nowTotalSeconds,
 					)
 				: this.sql.exec<ArrivalRow>(
 						`SELECT st.*, t.route_id, t.service_id, s.stop_name
          FROM stop_times st
          JOIN trips t ON t.trip_id = st.trip_id
          JOIN stops s ON s.stop_id = st.stop_id
-         WHERE s.stop_id = $1 or s.parent_station = $1 AND st.arrival_total_seconds >= $3
+         WHERE (s.stop_id == $1 OR s.parent_station == $1) AND (st.arrival_total_seconds >= $2)
          ORDER BY st.arrival_total_seconds
-				 LIMIT $2`,
+				 LIMIT $3`,
 						stationId,
+						nowTotalSeconds,
 						// double the limit to account for services that aren't active today
 						limit * 2,
-						nowTotalSeconds,
 					);
 
 			const rows = arrivalCursor.toArray();
@@ -430,6 +431,7 @@ export class MtaStateObject extends DurableObject {
 			// • the arrival time is later than now, and
 			// • the service is active today.
 			for (const row of rows) {
+				console.log(row);
 				const arrivalTime = Temporal.PlainTime.from({
 					hour: row.arrival_hours,
 					minute: row.arrival_minutes,
