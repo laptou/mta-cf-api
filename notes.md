@@ -43,3 +43,6 @@ now it loads the gtfs tables very fast, and my API is working in the cloud.
   wonder why. i assumed that the difference was related to whether or not you
   needed to execute async code in the callback, so i switched it to
   transactionSync. i also used transactionSync in the slow js implementation.
+
+- discovered a bug? where putting placeholders out of order will not work as
+  expected

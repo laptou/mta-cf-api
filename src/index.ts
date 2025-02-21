@@ -379,13 +379,12 @@ export class MtaStateObject extends DurableObject {
 				service_id: string;
 			};
 
-			const now = Temporal.Now.plainTimeISO('America/New_York');
-			const nowTotalSeconds = now
-				.since(Temporal.PlainTime.from("00:00:00"))
-				.total("second") | 0;
-			// const nowTotalSeconds = 49_000;
+			const now = Temporal.Now.plainTimeISO("America/New_York");
+			const nowTotalSeconds =
+				now.since(Temporal.PlainTime.from("00:00:00")).total("second") | 0;
 
-			console.log({ now, nowTotalSeconds });
+			const activeServiceIds = await this.getActiveServiceIds();
+			// console.log({ activeServiceIds });
 
 			const arrivalCursor = lineId
 				? this.sql.exec<ArrivalRow>(
@@ -393,7 +392,10 @@ export class MtaStateObject extends DurableObject {
 						FROM stop_times st
 						JOIN trips t ON t.trip_id = st.trip_id
 						JOIN stops s ON s.stop_id = st.stop_id
-						WHERE (s.stop_id == $1 or s.parent_station == $1) AND (t.route_id == $2) AND (st.arrival_total_seconds >= $3)
+						WHERE (s.stop_id == $1 or s.parent_station == $1) 
+							AND (t.route_id == $2) 
+							AND (st.arrival_total_seconds >= $3) 
+							AND (t.service_id IN (${activeServiceIds.map((i) => `"${i}"`).join(",")}))
 						ORDER BY st.arrival_total_seconds
 						LIMIT $4`,
 						stationId,
@@ -404,12 +406,14 @@ export class MtaStateObject extends DurableObject {
 					)
 				: this.sql.exec<ArrivalRow>(
 						`SELECT st.*, t.route_id, t.service_id, s.stop_name
-         FROM stop_times st
-         JOIN trips t ON t.trip_id = st.trip_id
-         JOIN stops s ON s.stop_id = st.stop_id
-         WHERE (s.stop_id == $1 OR s.parent_station == $1) AND (st.arrival_total_seconds >= $2)
-         ORDER BY st.arrival_total_seconds
-				 LIMIT $3`,
+						FROM stop_times st
+						JOIN trips t ON t.trip_id = st.trip_id
+						JOIN stops s ON s.stop_id = st.stop_id
+						WHERE (s.stop_id == $1 OR s.parent_station == $1) 
+							AND (st.arrival_total_seconds >= $2) 
+							AND (t.service_id IN (${activeServiceIds.map((i) => `"${i}"`).join(",")}))
+						ORDER BY st.arrival_total_seconds
+						LIMIT $3`,
 						stationId,
 						nowTotalSeconds,
 						// double the limit to account for services that aren't active today
@@ -440,7 +444,10 @@ export class MtaStateObject extends DurableObject {
 
 				// Check if the service for this row is active today.
 				const isActive = await this.isServiceActiveToday(row.service_id);
-				if (!isActive) continue;
+				if (!isActive) {
+					console.log("inactive service", row.service_id);
+					continue;
+				}
 
 				const departureTime = Temporal.PlainTime.from({
 					hour: row.departure_hours,
@@ -468,6 +475,70 @@ export class MtaStateObject extends DurableObject {
 		} catch (e) {
 			return new Response(`Error: ${e}`, { status: 500 });
 		}
+	}
+
+	/**
+	 * Returns a list of all active service ids for today.
+	 */
+	async getActiveServiceIds(): Promise<string[]> {
+		const today = Temporal.Now.plainDateISO();
+		type CalendarRow = {
+			service_id: string;
+			monday: number;
+			tuesday: number;
+			wednesday: number;
+			thursday: number;
+			friday: number;
+			saturday: number;
+			sunday: number;
+			start_date: string;
+			end_date: string;
+		};
+
+		const cursor = this.sql.exec<CalendarRow>("SELECT * FROM calendar");
+		const rows = cursor.toArray();
+		const activeIds: string[] = [];
+
+		for (const service of rows) {
+			// Convert dates
+			const startDate = parseGtfsDate(service.start_date);
+			const endDate = parseGtfsDate(service.end_date);
+			if (
+				Temporal.PlainDate.compare(today, startDate) < 0 ||
+				Temporal.PlainDate.compare(today, endDate) > 0
+			) {
+				continue;
+			}
+
+			// Using ISO weekday numbering: Monday=1, Sunday=7.
+			const day = today.dayOfWeek;
+			let active = false;
+			switch (day) {
+				case 1:
+					active = service.monday === 1;
+					break;
+				case 2:
+					active = service.tuesday === 1;
+					break;
+				case 3:
+					active = service.wednesday === 1;
+					break;
+				case 4:
+					active = service.thursday === 1;
+					break;
+				case 5:
+					active = service.friday === 1;
+					break;
+				case 6:
+					active = service.saturday === 1;
+					break;
+				case 7:
+					active = service.sunday === 1;
+					break;
+			}
+			if (active) activeIds.push(service.service_id);
+		}
+		return activeIds;
 	}
 
 	/**
