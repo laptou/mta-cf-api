@@ -13,6 +13,27 @@ function parseGtfsDate(date: string): Temporal.PlainDate {
 const MTA_SUPPLEMENTED_GTFS_STATIC_URL =
 	"https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip";
 
+type RealtimeStatusGroup =
+	| "ACE"
+	| "BDFM"
+	| "G"
+	| "JZ"
+	| "NQRW"
+	| "L"
+	| "1234567"
+	| "SIR";
+
+const realtimeStatusGroups: RealtimeStatusGroup[] = [
+	"ACE",
+	"BDFM",
+	"G",
+	"JZ",
+	"NQRW",
+	"L",
+	"1234567",
+	"SIR",
+];
+
 export class MtaStateObject extends DurableObject {
 	sql: SqlStorage;
 
@@ -25,6 +46,7 @@ export class MtaStateObject extends DurableObject {
 		state.blockConcurrencyWhile(async () => {
 			await this.initializeDatabase();
 			await this.loadGtfsStatic();
+			await this.ctx.storage.setAlarm(+new Date() + 1_000);
 		});
 	}
 
@@ -110,6 +132,17 @@ export class MtaStateObject extends DurableObject {
     `);
 	}
 
+	async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
+		console.log("handling alarm");
+
+		await Promise.all(
+			realtimeStatusGroups.map((rt) => this.updateRealtimeStatus(rt)),
+		);
+
+		// update realtime data every 2 minutes
+		this.ctx.storage.setAlarm(+new Date() + 60_000 * 2);
+	}
+
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 		console.log("handling response", url.pathname);
@@ -131,19 +164,6 @@ export class MtaStateObject extends DurableObject {
 			case "/arrivals":
 				response = await this.handleGetUpcomingArrivals(url.searchParams);
 				break;
-			case "/rt":
-				response = new Response(
-					JSON.stringify(
-						await this.getRealtimeStatus(),
-						(key, value) =>
-							typeof value === "bigint" ? value.toString() : value, // return everything else unchanged
-					),
-				);
-				break;
-			case "/rt-update":
-				await this.updateRealtimeStatus();
-				response = new Response("done");
-				break;
 			default:
 				response = new Response("not found", { status: 404 });
 		}
@@ -157,6 +177,7 @@ export class MtaStateObject extends DurableObject {
 	 * Loads data from the GTFS zip file into SQL.
 	 */
 	private async shouldUpdateGtfs(): Promise<boolean> {
+		// return true;
 		const cursor = this.sql.exec<{ value: string }>(
 			"SELECT value FROM metadata WHERE key = 'last_gtfs_update'",
 		);
@@ -441,7 +462,7 @@ export class MtaStateObject extends DurableObject {
 				now.since(Temporal.PlainTime.from("00:00:00")).total("second") | 0;
 
 			const activeServiceIds = await this.getActiveServiceIds();
-			// console.log({ activeServiceIds });
+			// console.log({ activeServiceIds, nowTotalSeconds });
 
 			const arrivalCursor = routeId
 				? this.sql.exec<ArrivalRow>(
@@ -491,21 +512,10 @@ export class MtaStateObject extends DurableObject {
 
 			const zeroTime = Temporal.PlainTime.from("00:00:00");
 
-			// For each stop_time row, check if:
-			// • the arrival time is later than now, and
-			// • the service is active today.
 			for (const row of rows) {
-				console.log(row);
 				const arrivalTime = zeroTime.add({
 					seconds: row.arrival_total_seconds,
 				});
-
-				// Check if the service for this row is active today.
-				const isActive = await this.isServiceActiveToday(row.service_id);
-				if (!isActive) {
-					console.log("inactive service", row.service_id);
-					continue;
-				}
 
 				const departureTime = zeroTime.add({
 					seconds: row.departure_total_seconds,
@@ -656,16 +666,50 @@ export class MtaStateObject extends DurableObject {
 		}
 	}
 
-	async getRealtimeStatus(): Promise<FeedMessage> {
-		const endpoint =
-			"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace";
+	async getRealtimeStatus(group: RealtimeStatusGroup): Promise<FeedMessage> {
+		let endpoint: string;
+
+		switch (group) {
+			case "ACE":
+				endpoint =
+					"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace";
+				break;
+			case "BDFM":
+				endpoint =
+					"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm";
+				break;
+			case "G":
+				endpoint =
+					"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-g";
+				break;
+			case "JZ":
+				endpoint =
+					"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-jz";
+				break;
+			case "NQRW":
+				endpoint =
+					"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-nqrw";
+				break;
+			case "L":
+				endpoint =
+					"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-l";
+				break;
+			case "1234567":
+				endpoint =
+					"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs";
+				break;
+			case "SIR":
+				endpoint =
+					"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-si";
+				break;
+		}
 
 		const response = await fetch(new Request(endpoint));
 		return FeedMessage.fromBinary(await response.bytes());
 	}
 
-	async updateRealtimeStatus() {
-		const status = await this.getRealtimeStatus();
+	async updateRealtimeStatus(group: RealtimeStatusGroup) {
+		const status = await this.getRealtimeStatus(group);
 		const activeServices = await this.getActiveServiceIds();
 
 		await this.ctx.storage.transaction(async () => {
@@ -721,19 +765,19 @@ export class MtaStateObject extends DurableObject {
 									.total("seconds") | 0
 							: null;
 
-						console.log(
-							"processing stop time update for trip",
-							tripIdSuffix,
-							stopTimeUpdate.stopId,
-							newArrival,
-							newDeparture,
-						);
+						// console.log(
+						// 	"processing stop time update for trip",
+						// 	tripIdSuffix,
+						// 	stopTimeUpdate.stopId,
+						// 	newArrival,
+						// 	newDeparture,
+						// );
 
-						const result = this.sql.exec(
+						this.sql.exec(
 							`
 							UPDATE stop_times 
-							SET arrival_total_seconds = NULLIF($1, arrival_total_seconds), 
-								departure_total_seconds = NULLIF($2, departure_total_seconds), 
+							SET arrival_total_seconds = IFNULL($1, arrival_total_seconds), 
+								departure_total_seconds = IFNULL($2, departure_total_seconds), 
 								is_realtime_updated = 1
 							WHERE trip_id IN (${tripIds.map((t) => `"${t}"`).join(",")}) AND stop_id == $4
 						`,
@@ -742,11 +786,13 @@ export class MtaStateObject extends DurableObject {
 							stopTimeUpdate.stopId,
 						);
 
-						console.log("rows written", result.rowsWritten);
+						// console.log("rows written", result.rowsWritten);
 					}
 				}
 			}
 		});
+
+		console.log('updated realtime status for ', group);
 	}
 }
 
