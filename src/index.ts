@@ -45,7 +45,21 @@ export class MtaStateObject extends DurableObject {
 
 		state.blockConcurrencyWhile(async () => {
 			await this.initializeDatabase();
-			await this.loadGtfsStatic();
+
+			const lastUpdate = await this.lastGtfsStaticUpdate();
+
+			if (lastUpdate === null) {
+				// block concurrency to load gtfs table b/c we don't have any data
+				await this.loadGtfsStatic();
+			} else {
+				if (this.shouldUpdateGtfs(lastUpdate)) {
+					// don't block concurrency, but reload gtfs table
+					state.waitUntil(this.loadGtfsStatic());
+				} else {
+					console.log("not updating static gtfs");
+				}
+			}
+
 			await this.ctx.storage.setAlarm(+new Date() + 1_000);
 		});
 	}
@@ -123,6 +137,7 @@ export class MtaStateObject extends DurableObject {
 
 			CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times(stop_id);
       CREATE INDEX IF NOT EXISTS idx_trips_route_id ON trips(route_id);
+      CREATE INDEX IF NOT EXISTS idx_trips_service_id ON trips(service_id);
       CREATE INDEX IF NOT EXISTS idx_stops_parent_station ON stops(parent_station);
 
       CREATE TABLE IF NOT EXISTS metadata (
@@ -171,20 +186,21 @@ export class MtaStateObject extends DurableObject {
 		return response;
 	}
 
-	// --- Handler Implementations ---
-
-	/**
-	 * Loads data from the GTFS zip file into SQL.
-	 */
-	private async shouldUpdateGtfs(): Promise<boolean> {
-		// return true;
+	private async lastGtfsStaticUpdate(): Promise<Temporal.Instant | null> {
 		const cursor = this.sql.exec<{ value: string }>(
 			"SELECT value FROM metadata WHERE key = 'last_gtfs_update'",
 		);
 		const rows = cursor.toArray();
-		if (rows.length === 0) return true;
+		if (rows.length === 0) return null;
 
 		const lastUpdate = Temporal.Instant.from(rows[0].value);
+		return lastUpdate;
+	}
+
+	/**
+	 * Loads data from the GTFS zip file into SQL.
+	 */
+	private shouldUpdateGtfs(lastUpdate: Temporal.Instant): boolean {
 		const now = Temporal.Now.instant();
 		const diff = now.since(lastUpdate);
 		console.log("last gtfs update", lastUpdate.toString(), diff.toString());
@@ -192,11 +208,6 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	async loadGtfsStatic() {
-		if (!(await this.shouldUpdateGtfs())) {
-			console.log("not updating static gtfs");
-			return;
-		}
-
 		console.log("updating static gtfs");
 
 		try {
@@ -472,15 +483,13 @@ export class MtaStateObject extends DurableObject {
 						JOIN stops s ON s.stop_id = st.stop_id
 						WHERE (s.stop_id == $1 or s.parent_station == $1) 
 							AND (t.route_id == $2) 
-							AND (st.arrival_total_seconds >= $3) 
 							AND (t.service_id IN (${activeServiceIds.map((i) => `"${i}"`).join(",")}))
-						ORDER BY st.arrival_total_seconds
+						ORDER BY mod(st.arrival_total_seconds - $3 + 86400, 86400)
 						LIMIT $4`,
 						stationId,
 						routeId,
 						nowTotalSeconds,
-						// double the limit to account for services that aren't active today
-						limit * 2,
+						limit,
 					)
 				: this.sql.exec<ArrivalRow>(
 						`SELECT st.*, t.route_id, t.service_id, s.stop_name
@@ -488,14 +497,12 @@ export class MtaStateObject extends DurableObject {
 						JOIN trips t ON t.trip_id = st.trip_id
 						JOIN stops s ON s.stop_id = st.stop_id
 						WHERE (s.stop_id == $1 OR s.parent_station == $1) 
-							AND (st.arrival_total_seconds >= $2) 
 							AND (t.service_id IN (${activeServiceIds.map((i) => `"${i}"`).join(",")}))
-						ORDER BY st.arrival_total_seconds
+						ORDER BY mod(st.arrival_total_seconds - $2 + 86400, 86400)
 						LIMIT $3`,
 						stationId,
 						nowTotalSeconds,
-						// double the limit to account for services that aren't active today
-						limit * 2,
+						limit,
 					);
 
 			const rows = arrivalCursor.toArray();
@@ -792,7 +799,7 @@ export class MtaStateObject extends DurableObject {
 			}
 		});
 
-		console.log('updated realtime status for ', group);
+		console.log("updated realtime status for ", group);
 	}
 }
 
