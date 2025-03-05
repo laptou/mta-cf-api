@@ -10,10 +10,10 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.4",
-		"@cloudflare/workers-types": "^4.20250214.0",
+		"@cloudflare/workers-types": "^4.20250303.0",
 		"@protobuf-ts/plugin": "^2.9.4",
-		"typescript": "^5.5.2",
-		"wrangler": "^3.109.2"
+		"typescript": "^5.8.2",
+		"wrangler": "^3.112.0"
 	},
 	"dependencies": {
 		"temporal-polyfill": "^0.2.5",
