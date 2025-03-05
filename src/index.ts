@@ -34,6 +34,165 @@ const realtimeStatusGroups: RealtimeStatusGroup[] = [
 	"SIR",
 ];
 
+type StopRow = {
+	stop_id: string;
+	stop_code: string | null;
+	stop_name: string;
+	stop_desc: string | null;
+	stop_lat: number;
+	stop_lon: number;
+	zone_id: string | null;
+	stop_url: string | null;
+	location_type: number | null;
+	parent_station: string | null;
+	stop_timezone: string | null;
+	wheelchair_boarding: number | null;
+	level_id: string | null;
+	platform_code: string | null;
+};
+
+type RouteRow = {
+	route_id: string;
+	agency_id: string;
+	route_short_name: string;
+	route_long_name: string;
+	route_type: number;
+	route_desc: string | null;
+	route_url: string | null;
+	route_color: string | null;
+	route_text_color: string | null;
+};
+
+function transformStopToResponse(stop: StopRow) {
+	return {
+		stopId: stop.stop_id,
+		stopCode: stop.stop_code,
+		stopName: stop.stop_name,
+		stopDesc: stop.stop_desc,
+		stopLat: stop.stop_lat,
+		stopLon: stop.stop_lon,
+		zoneId: stop.zone_id,
+		stopUrl: stop.stop_url,
+		locationType: stop.location_type,
+		parentStation: stop.parent_station,
+		stopTimezone: stop.stop_timezone,
+		wheelchairBoarding: stop.wheelchair_boarding,
+		levelId: stop.level_id,
+		platformCode: stop.platform_code,
+	};
+}
+
+function transformRouteToResponse(route: RouteRow) {
+	return {
+		routeId: route.route_id,
+		agencyId: route.agency_id,
+		routeShortName: route.route_short_name,
+		routeLongName: route.route_long_name,
+		routeType: route.route_type,
+		routeDesc: route.route_desc,
+		routeUrl: route.route_url,
+		routeColor: route.route_color,
+		routeTextColor: route.route_text_color,
+	};
+}
+
+type ArrivalInfo = {
+	route: string;
+	tripId: string;
+	stopId: string;
+	stopName: string;
+	arrivalTime: Temporal.PlainTime;
+	departureTime: Temporal.PlainTime;
+	isRealtimeUpdated: boolean;
+	stopSequence: number;
+};
+
+type ArrivalRow = {
+	is_realtime_updated: 0 | 1;
+	trip_id: string;
+	stop_id: string;
+	stop_name: string;
+	arrival_total_seconds: number;
+	departure_total_seconds: number;
+	stop_sequence: number;
+	route_id: string;
+	service_id: string;
+};
+
+async function getUpcomingArrivalsAtStop(
+	sql: SqlStorage,
+	stationId: string,
+	routeId: string | null,
+	limit: number,
+	activeServiceIds: string[],
+): Promise<ArrivalInfo[]> {
+	const now = Temporal.Now.plainTimeISO("America/New_York");
+	const nowTotalSeconds =
+		now.since(Temporal.PlainTime.from("00:00:00")).total("second") | 0;
+
+	const arrivalCursor = routeId
+		? sql.exec<ArrivalRow>(
+				`SELECT st.*, t.route_id, t.service_id, s.stop_name
+				FROM stop_times st
+				JOIN trips t ON t.trip_id = st.trip_id
+				JOIN stops s ON s.stop_id = st.stop_id
+				WHERE (s.stop_id == $1 or s.parent_station == $1) 
+					AND (t.route_id == $2) 
+					AND (t.service_id IN (${activeServiceIds.map(() => "?").join(",")}))
+				ORDER BY mod(st.arrival_total_seconds - $3 + 86400, 86400)
+				LIMIT $4`,
+				stationId,
+				routeId,
+				...activeServiceIds,
+				nowTotalSeconds,
+				limit,
+			)
+		: sql.exec<ArrivalRow>(
+				`SELECT st.*, t.route_id, t.service_id, s.stop_name
+				FROM stop_times st
+				JOIN trips t ON t.trip_id = st.trip_id
+				JOIN stops s ON s.stop_id = st.stop_id
+				WHERE (s.stop_id == $1 OR s.parent_station == $1) 
+					AND (t.service_id IN (${activeServiceIds.map(() => "?").join(",")}))
+				ORDER BY mod(st.arrival_total_seconds - $2 + 86400, 86400)
+				LIMIT $3`,
+				stationId,
+				...activeServiceIds,
+				nowTotalSeconds,
+				limit,
+			);
+
+	const rows = arrivalCursor.toArray();
+	const upcoming: ArrivalInfo[] = [];
+
+	const zeroTime = Temporal.PlainTime.from("00:00:00");
+
+	for (const row of rows) {
+		const arrivalTime = zeroTime.add({
+			seconds: row.arrival_total_seconds,
+		});
+
+		const departureTime = zeroTime.add({
+			seconds: row.departure_total_seconds,
+		});
+
+		upcoming.push({
+			route: row.route_id,
+			tripId: row.trip_id,
+			stopId: row.stop_id,
+			stopName: row.stop_name,
+			arrivalTime,
+			departureTime,
+			isRealtimeUpdated: row.is_realtime_updated > 0,
+			stopSequence: row.stop_sequence,
+		});
+
+		if (upcoming.length >= limit) break;
+	}
+
+	return upcoming;
+}
+
 export class MtaStateObject extends DurableObject {
 	sql: SqlStorage;
 
@@ -49,14 +208,16 @@ export class MtaStateObject extends DurableObject {
 			const lastUpdate = await this.lastGtfsStaticUpdate();
 
 			if (lastUpdate === null) {
+				console.log("loading gtfs static b/c no previous update");
 				// block concurrency to load gtfs table b/c we don't have any data
 				await this.loadGtfsStatic();
 			} else {
 				if (this.shouldUpdateGtfs(lastUpdate)) {
+					console.log("loading gtfs static async");
 					// don't block concurrency, but reload gtfs table
 					state.waitUntil(this.loadGtfsStatic());
 				} else {
-					console.log("not updating static gtfs");
+					console.log("not loading gtfs static");
 				}
 			}
 
@@ -159,31 +320,41 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		const url = new URL(request.url);
-		console.log("handling response", url.pathname);
+		try {
+			const url = new URL(request.url);
+			console.log("handling response", url.pathname);
 
-		let response: Response;
-		switch (url.pathname) {
-			case "/route":
-				response = await this.handleGetRoute(url.searchParams);
-				break;
-			case "/routes":
-				response = await this.handleGetAllRoutes();
-				break;
-			case "/stations":
-				response = await this.handleGetStationsForRoute(url.searchParams);
-				break;
-			case "/station":
-				response = await this.handleGetStation(url.searchParams);
-				break;
-			case "/arrivals":
-				response = await this.handleGetUpcomingArrivals(url.searchParams);
-				break;
-			default:
-				response = new Response("not found", { status: 404 });
+			let response: Response;
+			switch (url.pathname) {
+				case "/route":
+					response = await this.handleGetRoute(url.searchParams);
+					break;
+				case "/routes":
+					response = await this.handleGetAllRoutes();
+					break;
+				case "/stations":
+					response = await this.handleGetStationsForRoute(url.searchParams);
+					break;
+				case "/station":
+					response = await this.handleGetStation(url.searchParams);
+					break;
+				case "/arrivals":
+					response = await this.handleGetUpcomingArrivals(url.searchParams);
+					break;
+				default:
+					response = new Response("not found", { status: 404 });
+			}
+
+			return response;
+		} catch (error) {
+			console.error(
+				"error handling response",
+				error,
+				error instanceof Error ? error.message : String(error),
+				error instanceof Error ? error.stack : undefined,
+			);
+			return new Response("error", { status: 500 });
 		}
-
-		return response;
 	}
 
 	private async lastGtfsStaticUpdate(): Promise<Temporal.Instant | null> {
@@ -225,52 +396,89 @@ export class MtaStateObject extends DurableObject {
 				"last_gtfs_update",
 				now.toString(),
 			);
+
+			console.log("updated static gtfs");
 		} catch (err) {
-			console.error(err);
+			console.error("gtfs static update failed", err);
 			throw err instanceof Error ? err : new Error(String(err));
 		}
 	}
 
+	/**
+	 * Returns information about a route. If expanded=true, includes all stations and upcoming arrivals.
+	 */
 	async handleGetRoute(params: URLSearchParams): Promise<Response> {
 		const routeId = params.get("routeId");
 		if (!routeId) {
 			return new Response("missing routeId parameter", { status: 400 });
 		}
 
-		try {
-			// Use a generic type in case you need type hints.
-			type RouteRow = {
-				route_id: string;
-				agency_id: string;
-				route_short_name: string;
-				route_long_name: string;
-				route_type: number;
-				route_desc: string | null;
-				route_url: string | null;
-				route_color: string | null;
-				route_text_color: string | null;
-			};
+		const expanded = params.get("expanded") === "true";
 
-			const cursor = this.sql.exec<RouteRow>(
-				"SELECT * FROM routes WHERE route_id = $1",
+		try {
+			// Get route details
+			const routeCursor = this.sql.exec<RouteRow>(
+				"SELECT * FROM routes WHERE route_id = ?",
 				routeId,
 			);
+			const route = routeCursor.one();
 
-			const route = cursor.one();
+			// If not expanded, return basic route info
+			if (!expanded) {
+				return new Response(JSON.stringify(transformRouteToResponse(route)), {
+					headers: { "Content-Type": "application/json" },
+				});
+			}
 
-			const camelCaseRoute = {
-				routeId: route.route_id,
-				agencyId: route.agency_id,
-				routeShortName: route.route_short_name,
-				routeLongName: route.route_long_name,
-				routeType: route.route_type,
-				routeDesc: route.route_desc,
-				routeUrl: route.route_url,
-				routeColor: route.route_color,
-				routeTextColor: route.route_text_color,
+			// Get all stations served by this route
+			const stopsCursor = this.sql.exec<StopRow>(
+				`
+				SELECT DISTINCT s.*
+				FROM stops s
+				WHERE s.stop_id IN (
+					SELECT st.stop_id
+					FROM stop_times st
+					JOIN trips t ON t.trip_id = st.trip_id
+					WHERE t.route_id = ?
+				)
+				OR s.stop_id IN (
+					SELECT DISTINCT s2.parent_station
+					FROM stops s2
+					JOIN stop_times st ON st.stop_id = s2.stop_id
+					JOIN trips t ON t.trip_id = st.trip_id
+					WHERE t.route_id = ?
+						AND s2.parent_station IS NOT NULL
+				)
+				ORDER BY s.stop_name
+				`,
+				routeId,
+				routeId,
+			);
+			const stops = stopsCursor.toArray();
+
+			// Get active service IDs for arrival lookups
+			const activeServiceIds = await this.getActiveServiceIds();
+
+			// Get upcoming arrivals for each stop
+			const stopsWithArrivals = await Promise.all(
+				stops.map(async (stop) => ({
+					...transformStopToResponse(stop),
+					upcomingArrivals: await getUpcomingArrivalsAtStop(
+						this.sql,
+						stop.stop_id,
+						routeId,
+						6, // Get next 6 arrivals
+						activeServiceIds,
+					),
+				})),
+			);
+
+			const response = {
+				route: transformRouteToResponse(route),
+				stations: stopsWithArrivals,
 			};
 
-			return new Response(JSON.stringify(camelCaseRoute), {
+			return new Response(JSON.stringify(response), {
 				headers: { "Content-Type": "application/json" },
 			});
 		} catch (e) {
@@ -284,33 +492,10 @@ export class MtaStateObject extends DurableObject {
 	 */
 	async handleGetAllRoutes(): Promise<Response> {
 		try {
-			// Use a generic type in case you need type hints.
-			type RouteRow = {
-				route_id: string;
-				agency_id: string;
-				route_short_name: string;
-				route_long_name: string;
-				route_type: number;
-				route_desc: string | null;
-				route_url: string | null;
-				route_color: string | null;
-				route_text_color: string | null;
-			};
-
 			const cursor = this.sql.exec<RouteRow>("SELECT * FROM routes");
 			const routes = cursor.toArray();
-			const camelCaseRoutes = routes.map((route) => ({
-				routeId: route.route_id,
-				agencyId: route.agency_id,
-				routeShortName: route.route_short_name,
-				routeLongName: route.route_long_name,
-				routeType: route.route_type,
-				routeDesc: route.route_desc,
-				routeUrl: route.route_url,
-				routeColor: route.route_color,
-				routeTextColor: route.route_text_color,
-			}));
-			return new Response(JSON.stringify(camelCaseRoutes), {
+			const response = routes.map(transformRouteToResponse);
+			return new Response(JSON.stringify(response), {
 				headers: { "Content-Type": "application/json" },
 			});
 		} catch (e) {
@@ -381,46 +566,33 @@ export class MtaStateObject extends DurableObject {
 	}
 
 	/**
-	 * Returns the station details for a given stationId.
+	 * Returns station details for one or more stations.
+	 * Accepts either a single stationId or a comma-separated list of stationIds.
 	 */
 	async handleGetStation(params: URLSearchParams): Promise<Response> {
-		const stationId = params.get("stationId");
-		if (!stationId) {
+		const stationIds = params.get("stationId")?.split(",");
+		if (!stationIds?.length) {
 			return new Response("Missing stationId parameter", { status: 400 });
 		}
+
 		try {
-			const cursor = this.sql.exec(
-				"SELECT * FROM stops WHERE stop_id = ?",
-				stationId,
+			const cursor = this.sql.exec<StopRow>(
+				`SELECT * FROM stops WHERE stop_id IN (${stationIds.map(() => "?").join(",")})`,
+				...stationIds,
 			);
 
-			const rows = cursor.toArray();
-			if (rows.length === 0) {
-				return new Response("station not found", { status: 404 });
+			const stops = cursor.toArray();
+			if (stops.length === 0) {
+				return new Response("no stations found", { status: 404 });
 			}
 
-			const stop = rows[0];
-			const camelCaseStop = {
-				stopId: stop.stop_id,
-				stopCode: stop.stop_code,
-				stopName: stop.stop_name,
-				stopDesc: stop.stop_desc,
-				stopLat: stop.stop_lat,
-				stopLon: stop.stop_lon,
-				zoneId: stop.zone_id,
-				stopUrl: stop.stop_url,
-				locationType: stop.location_type,
-				parentStation: stop.parent_station,
-				stopTimezone: stop.stop_timezone,
-				wheelchairBoarding: stop.wheelchair_boarding,
-				levelId: stop.level_id,
-				platformCode: stop.platform_code,
-			};
-			return new Response(JSON.stringify(camelCaseStop), {
+			const response = stops.map(transformStopToResponse);
+			return new Response(JSON.stringify(response), {
 				headers: { "Content-Type": "application/json" },
 			});
 		} catch (e) {
-			return new Response(`Error: ${e}`, { status: 500 });
+			const error = e as Error;
+			return new Response(`Error: ${error.message}`, { status: 500 });
 		}
 	}
 
@@ -456,91 +628,15 @@ export class MtaStateObject extends DurableObject {
 
 			// Use the provided stationId as the stop_id.
 			// Get all upcoming stop_times for that stop joined with trips.
-			type ArrivalRow = {
-				is_realtime_updated: 0 | 1;
-				trip_id: string;
-				stop_id: string;
-				stop_name: string;
-				arrival_total_seconds: number;
-				departure_total_seconds: number;
-				stop_sequence: number;
-				route_id: string;
-				service_id: string;
-			};
-
-			const now = Temporal.Now.plainTimeISO("America/New_York");
-			const nowTotalSeconds =
-				now.since(Temporal.PlainTime.from("00:00:00")).total("second") | 0;
-
 			const activeServiceIds = await this.getActiveServiceIds();
-			// console.log({ activeServiceIds, nowTotalSeconds });
 
-			const arrivalCursor = routeId
-				? this.sql.exec<ArrivalRow>(
-						`SELECT st.*, t.route_id, t.service_id, s.stop_name
-						FROM stop_times st
-						JOIN trips t ON t.trip_id = st.trip_id
-						JOIN stops s ON s.stop_id = st.stop_id
-						WHERE (s.stop_id == $1 or s.parent_station == $1) 
-							AND (t.route_id == $2) 
-							AND (t.service_id IN (${activeServiceIds.map((i) => `"${i}"`).join(",")}))
-						ORDER BY mod(st.arrival_total_seconds - $3 + 86400, 86400)
-						LIMIT $4`,
-						stationId,
-						routeId,
-						nowTotalSeconds,
-						limit,
-					)
-				: this.sql.exec<ArrivalRow>(
-						`SELECT st.*, t.route_id, t.service_id, s.stop_name
-						FROM stop_times st
-						JOIN trips t ON t.trip_id = st.trip_id
-						JOIN stops s ON s.stop_id = st.stop_id
-						WHERE (s.stop_id == $1 OR s.parent_station == $1) 
-							AND (t.service_id IN (${activeServiceIds.map((i) => `"${i}"`).join(",")}))
-						ORDER BY mod(st.arrival_total_seconds - $2 + 86400, 86400)
-						LIMIT $3`,
-						stationId,
-						nowTotalSeconds,
-						limit,
-					);
-
-			const rows = arrivalCursor.toArray();
-			const upcoming: {
-				route: string;
-				tripId: string;
-				stopId: string;
-				stopName: string;
-				arrivalTime: Temporal.PlainTime;
-				departureTime: Temporal.PlainTime;
-				isRealtimeUpdated: boolean;
-				stopSequence: number;
-			}[] = [];
-
-			const zeroTime = Temporal.PlainTime.from("00:00:00");
-
-			for (const row of rows) {
-				const arrivalTime = zeroTime.add({
-					seconds: row.arrival_total_seconds,
-				});
-
-				const departureTime = zeroTime.add({
-					seconds: row.departure_total_seconds,
-				});
-
-				upcoming.push({
-					route: row.route_id,
-					tripId: row.trip_id,
-					stopId: row.stop_id,
-					stopName: row.stop_name,
-					arrivalTime,
-					departureTime,
-					isRealtimeUpdated: row.is_realtime_updated > 0,
-					stopSequence: row.stop_sequence,
-				});
-
-				if (upcoming.length >= limit) break;
-			}
+			const upcoming = await getUpcomingArrivalsAtStop(
+				this.sql,
+				stationId,
+				routeId,
+				limit,
+				activeServiceIds,
+			);
 
 			// Return the collected upcoming arrivals.
 			return new Response(JSON.stringify(upcoming), {
