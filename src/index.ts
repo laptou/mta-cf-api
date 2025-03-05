@@ -221,6 +221,18 @@ export class MtaStateObject extends DurableObject {
 				}
 			}
 
+			// initialize last updated group if not set
+			const cursor = this.sql.exec<{ value: string }>(
+				"SELECT value FROM metadata WHERE key = 'last_updated_group'",
+			);
+			if (cursor.toArray().length === 0) {
+				this.sql.exec(
+					"INSERT INTO metadata (key, value) VALUES (?, ?)",
+					"last_updated_group",
+					realtimeStatusGroups[realtimeStatusGroups.length - 1],
+				);
+			}
+
 			await this.ctx.storage.setAlarm(+new Date() + 1_000);
 		});
 	}
@@ -308,15 +320,37 @@ export class MtaStateObject extends DurableObject {
     `);
 	}
 
+	private async getNextGroupToUpdate(): Promise<RealtimeStatusGroup> {
+		const cursor = this.sql.exec<{ value: string }>(
+			"SELECT value FROM metadata WHERE key = 'last_updated_group'",
+		);
+		const lastGroup = cursor.toArray()[0].value as RealtimeStatusGroup;
+		
+		// find index of last group and get next one
+		const currentIndex = realtimeStatusGroups.indexOf(lastGroup);
+		const nextIndex = (currentIndex + 1) % realtimeStatusGroups.length;
+		const nextGroup = realtimeStatusGroups[nextIndex];
+
+		// update the last updated group
+		this.sql.exec(
+			"UPDATE metadata SET value = ? WHERE key = 'last_updated_group'",
+			nextGroup,
+		);
+
+		return nextGroup;
+	}
+
 	async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
 		console.log("handling alarm");
 
-		await Promise.all(
-			realtimeStatusGroups.map((rt) => this.updateRealtimeStatus(rt)),
-		);
+		// update just one group
+		const groupToUpdate = await this.getNextGroupToUpdate();
+		await this.updateRealtimeStatus(groupToUpdate);
+		console.log("updated group", groupToUpdate);
 
-		// update realtime data every 2 minutes
-		this.ctx.storage.setAlarm(+new Date() + 60_000 * 2);
+		// set alarm for next group - total cycle time should still be about 2 minutes
+		const intervalPerGroup = (2 * 60_000) / realtimeStatusGroups.length;
+		this.ctx.storage.setAlarm(+new Date() + intervalPerGroup);
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -440,7 +474,7 @@ export class MtaStateObject extends DurableObject {
 					FROM stop_times st
 					JOIN trips t ON t.trip_id = st.trip_id
 					WHERE t.route_id = ?
-				)
+				) AND s.parent_station IS NULL
 				OR s.stop_id IN (
 					SELECT DISTINCT s2.parent_station
 					FROM stops s2
